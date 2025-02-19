@@ -17,24 +17,18 @@ s = socket.socket (socket.AF_INET, socket.SOCK_STREAM)
 try:
     s.connect((target_IP, target_PORT))
     print("Connection successful!")
-    print("'x' to shutdown server.")
-    print("'.exit' to close connection.")
-
-    while True:
+    connection = True
+    while connection == True:
+        sdata = s.recv(BUF_SIZE)    
+        print("Server: ", sdata.decode())
         #user input data:
         data = input("Data to send => ")
         #check if data is null, else send
         if not data:
-            print("No data sent.")
-        elif data == ".exit":
-            print("Client exiting...")
-            break
+            s.send("-".encode())
         else:
-            #encode data as unencoded data in Python 3+ will result in error
+            #encode data as unencoded data in Python 3+ will result in erroR
             s.send(data.encode())
-            #recieve server response to data sent
-            data = s.recv(BUF_SIZE)
-            print("Server: ", data.decode())
 #except Exception as e:
 #    print("An error occurred: " + str(e))
 finally:

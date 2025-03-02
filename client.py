@@ -3,6 +3,8 @@ import elgalmal
 import threading
 import queue
 import time
+import getpass
+import sys
 
 target_PORT = 60
 target_IP = '127.0.0.1'
@@ -56,7 +58,7 @@ class Client:
                     msg, buffer = buffer.split('\n', 1)
                     msg = msg.strip()
                     if msg:
-                        if msg.startswith(("SUCCESS:", "ERROR:", "PROXIMITY:", "PUBKEY:")):
+                        if msg.startswith(("SUCCESS:", "ERROR:", "PROXIMITY:", "PUBKEY:", "REQUESTS:", "FRIENDS:")):
                             with self.lock:
                                 self.response_queue.put(msg)
                         elif msg.startswith(("MESSAGE:", "NOTIFICATION:")):
@@ -107,6 +109,15 @@ class Client:
 
     def add_friend(self, friend):
         return self.send_command(f"ADD_FRIEND:{friend}\n".encode())
+
+    def get_friend_requests(self):
+        return self.send_command(f"GET_REQUESTS:\n".encode())
+
+    def respond_to_request(self, sender, response):
+        return self.send_command(f"FRIEND_RESPONSE:{sender}:{response}\n".encode())
+
+    def get_friends_list(self):
+        return self.send_command(f"GET_FRIENDS:\n".encode())
 
     def update_location(self, x, y):
         try:
@@ -166,6 +177,66 @@ class Client:
                 print(f"\n[!] {msg.split(':', 1)[1]}")
 
 
+def masked_input():
+    """Custom function to handle password input with masking characters"""
+    password = ""
+    print("Password: ", end="", flush=True)
+
+    # For Windows
+    if sys.platform == 'win32':
+        import msvcrt
+        while True:
+            key = msvcrt.getch()
+            # Convert bytes to string
+            key_decoded = key.decode('utf-8') if hasattr(key, 'decode') else key
+
+            # Check for Enter key
+            if key == b'\r' or key == b'\n' or key_decoded == '\r' or key_decoded == '\n':
+                print()
+                break
+            # Check for backspace
+            elif key == b'\b' or key_decoded == '\b':
+                if len(password) > 0:
+                    password = password[:-1]
+                    # Erase the last * from screen
+                    print('\b \b', end='', flush=True)
+            # Check for Ctrl+C or other control characters
+            elif key_decoded in ('\x03', '\x04'):  # Ctrl+C, Ctrl+D
+                raise KeyboardInterrupt
+            else:
+                password += key_decoded
+                print('*', end='', flush=True)
+    # For Unix/Linux/MacOS
+    else:
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                key = sys.stdin.read(1)
+                # Check for Enter key
+                if key == '\r' or key == '\n':
+                    print()
+                    break
+                # Check for backspace
+                elif key == '\x7f':  # backspace
+                    if len(password) > 0:
+                        password = password[:-1]
+                        # Erase the last * from screen
+                        print('\b \b', end='', flush=True)
+                # Check for Ctrl+C or other control characters
+                elif key in ('\x03', '\x04'):  # Ctrl+C, Ctrl+D
+                    raise KeyboardInterrupt
+                else:
+                    password += key
+                    print('*', end='', flush=True)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    return password
+
+
 def main():
     client = Client()
     if not client.connect():
@@ -180,12 +251,24 @@ def main():
 
         if choice == '1':
             username = input("Username: ").strip()
-            password = input("Password: ").strip()
+            # Try to use getpass, fall back to input if it fails
+            try:
+                print("Password: ", end='', flush=True)
+                password = getpass.getpass("")
+            except Exception:
+                # If getpass fails, use input with a custom masking function
+                password = masked_input()
             print(client.register(username, password))
 
         elif choice == '2':
             username = input("Username: ").strip()
-            password = input("Password: ").strip()
+            # Try to use getpass, fall back to input if it fails
+            try:
+                print("Password: ", end='', flush=True)
+                password = getpass.getpass("")
+            except Exception:
+                # If getpass fails, use input with a custom masking function
+                password = masked_input()
             if client.login(username, password):
                 print("Login successful!")
                 while True:
@@ -208,12 +291,67 @@ def main():
     # Main menu
     while client.running:
         client.print_messages()
-        print("\n1. Add Friend\n2. Update Location\n3. Check Proximity\n4. Send Message\n5. Exit")
+        print("\n1. Friend Management\n2. Update Location\n3. Check Proximity\n4. Send Message\n5. Exit")
         choice = input("Choice: ").strip()
 
         if choice == '1':
-            friend = input("Friend's username: ").strip()
-            print(client.add_friend(friend))
+            print("\nFriend Management:")
+            print("1. Send Friend Request")
+            print("2. View Friend Requests")
+            print("3. View Friends List")
+            print("4. Back to Main Menu")
+
+            friend_choice = input("Choice: ").strip()
+
+            if friend_choice == '1':
+                friend = input("Friend's username: ").strip()
+                response = client.add_friend(friend)
+                print(response)
+
+            elif friend_choice == '2':
+                response = client.get_friend_requests()
+                if response.startswith("REQUESTS:"):
+                    requests = response.split(':', 1)[1].strip()
+                    if not requests:
+                        print("No pending friend requests.")
+                    else:
+                        requests_list = requests.split(',')
+                        print("\nPending Friend Requests:")
+                        for req in requests_list:
+                            print(f"- {req}")
+
+                        if requests_list:
+                            print("\nRespond to a request? (y/n)")
+                            if input().strip().lower() == 'y':
+                                sender = input("Enter username of the request to respond to: ").strip()
+                                if sender in requests_list:
+                                    print(f"Accept request from {sender}? (y/n)")
+                                    resp = "ACCEPT" if input().strip().lower() == 'y' else "DECLINE"
+                                    print(client.respond_to_request(sender, resp))
+                                else:
+                                    print(f"Error: No pending request from {sender}.")
+                else:
+                    print(response)
+
+            elif friend_choice == '3':
+                response = client.get_friends_list()
+                if response.startswith("FRIENDS:"):
+                    friends = response.split(':', 1)[1].strip()
+                    if not friends:
+                        print("You don't have any friends yet.")
+                    else:
+                        friends_list = friends.split(',')
+                        print("\nYour Friends:")
+                        for i, friend in enumerate(friends_list, 1):
+                            print(f"{i}. {friend}")
+                else:
+                    print(response)
+
+            elif friend_choice == '4':
+                continue
+
+            else:
+                print("Invalid choice")
 
         elif choice == '2':
             try:
@@ -224,13 +362,47 @@ def main():
                 print("Invalid coordinates")
 
         elif choice == '3':
-            friend = input("Friend's username: ").strip()
-            client.check_proximity(friend)
+            # First, get the list of friends
+            response = client.get_friends_list()
+            if response.startswith("FRIENDS:"):
+                friends = response.split(':', 1)[1].strip()
+                if not friends:
+                    print("You don't have any friends yet.")
+                else:
+                    friends_list = friends.split(',')
+                    print("\nYour Friends:")
+                    for friend in friends_list:
+                        print(f"- {friend}")
+
+                    friend_name = input("\nEnter friend's username to check proximity: ").strip()
+                    if friend_name in friends_list:
+                        client.check_proximity(friend_name)
+                    else:
+                        print(f"Error: {friend_name} is not in your friends list.")
+            else:
+                print(response)
 
         elif choice == '4':
-            friend = input("Friend: ").strip()
-            message = input("Message: ").strip()
-            print(client.send_message(friend, message))
+            # First, get the list of friends
+            response = client.get_friends_list()
+            if response.startswith("FRIENDS:"):
+                friends = response.split(':', 1)[1].strip()
+                if not friends:
+                    print("You don't have any friends yet.")
+                else:
+                    friends_list = friends.split(',')
+                    print("\nYour Friends:")
+                    for friend in friends_list:
+                        print(f"- {friend}")
+
+                    friend_name = input("\nEnter friend's username to message: ").strip()
+                    if friend_name in friends_list:
+                        message = input(f"Message for {friend_name}: ").strip()
+                        print(client.send_message(friend_name, message))
+                    else:
+                        print(f"Error: {friend_name} is not in your friends list.")
+            else:
+                print(response)
 
         elif choice == '5':
             client.running = False

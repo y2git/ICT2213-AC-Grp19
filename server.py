@@ -4,7 +4,6 @@ import threading
 import sqlite3
 import elgalmal
 
-
 server_PORT = 60
 server_IP = '127.0.0.1'
 BUF_SIZE = 4096
@@ -13,6 +12,7 @@ server_public_key = None
 server_private_key = None
 connected_clients = {}
 client_public_keys = {}  # Store client public keys
+
 
 def init_db():
     conn = sqlite3.connect('test.db', check_same_thread=False)
@@ -27,6 +27,15 @@ def init_db():
                           PRIMARY KEY(user1, user2),
                           FOREIGN KEY(user1) REFERENCES user(username),
                           FOREIGN KEY(user2) REFERENCES user(username))''')
+        # New table for friend requests
+        cursor.execute('''CREATE TABLE IF NOT EXISTS friend_requests
+                         (sender TEXT, 
+                          receiver TEXT,
+                          status TEXT DEFAULT 'pending',
+                          timestamp TEXT,
+                          PRIMARY KEY(sender, receiver),
+                          FOREIGN KEY(sender) REFERENCES user(username),
+                          FOREIGN KEY(receiver) REFERENCES user(username))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS public_keys
                          (username TEXT PRIMARY KEY,
                           p TEXT,
@@ -37,16 +46,20 @@ def init_db():
     finally:
         conn.close()
 
+
 def generate_global_keys():
     global server_public_key, server_private_key
     server_public_key, server_private_key = elgalmal.generate_keys()
 
+
 generate_global_keys()
+
 
 def get_db_connection():
     conn = sqlite3.connect('test.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def login_user(username, password):
     conn = get_db_connection()
@@ -56,6 +69,7 @@ def login_user(username, password):
         return cursor.fetchone() is not None
     finally:
         conn.close()
+
 
 def create_user(username, password):
     conn = get_db_connection()
@@ -68,6 +82,7 @@ def create_user(username, password):
         return False
     finally:
         conn.close()
+
 
 def update_location(username, enc_x, enc_y):
     encrypted_locations[username] = (enc_x, enc_y)
@@ -119,15 +134,18 @@ def handle_proximity_request(sender, target, con):
     finally:
         conn.close()
 
+
 def handle_friend_request(sender, target, con):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        # Check if target user exists
         cursor.execute('SELECT * FROM user WHERE username = ?', (target,))
         if not cursor.fetchone():
             con.send("ERROR:User not found\n".encode())
             return
 
+        # Check if they are already friends
         cursor.execute('''SELECT * FROM friendships 
                          WHERE (user1 = ? AND user2 = ?)
                          OR (user1 = ? AND user2 = ?)''',
@@ -136,16 +154,112 @@ def handle_friend_request(sender, target, con):
             con.send("ERROR:Already friends\n".encode())
             return
 
-        cursor.execute('INSERT INTO friendships VALUES (?, ?)', (sender, target))
-        conn.commit()
-        con.send("SUCCESS:Friend added\n".encode())
+        # Check for existing request in either direction
+        cursor.execute('''SELECT * FROM friend_requests 
+                         WHERE (sender = ? AND receiver = ?)''',
+                       (sender, target))
+        if cursor.fetchone():
+            con.send("ERROR:Friend request already sent\n".encode())
+            return
 
+        # Check if there's a pending request from target to sender
+        cursor.execute('''SELECT * FROM friend_requests 
+                         WHERE (sender = ? AND receiver = ? AND status = 'pending')''',
+                       (target, sender))
+        if cursor.fetchone():
+            # Auto-accept since the other person already sent a request
+            cursor.execute('DELETE FROM friend_requests WHERE sender = ? AND receiver = ?',
+                           (target, sender))
+            cursor.execute('INSERT INTO friendships VALUES (?, ?)', (sender, target))
+            conn.commit()
+            con.send("SUCCESS:Friend request accepted automatically\n".encode())
+
+            # Notify the other user if they're online
+            if target in connected_clients:
+                connected_clients[target][0].send(f"NOTIFICATION:{sender} accepted your friend request\n".encode())
+            return
+
+        # Create a new friend request
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute('INSERT INTO friend_requests VALUES (?, ?, ?, ?)',
+                       (sender, target, 'pending', timestamp))
+        conn.commit()
+        con.send("SUCCESS:Friend request sent\n".encode())
+
+        # Notify the target user if they're online
         if target in connected_clients:
-            connected_clients[target][0].send(f"NOTIFICATION:New friend: {sender}\n".encode())
+            connected_clients[target][0].send(f"NOTIFICATION:New friend request from {sender}\n".encode())
     except Exception as e:
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
         conn.close()
+
+
+def handle_friend_response(username, sender, response, con):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        # Check if there is a pending request
+        cursor.execute('''SELECT * FROM friend_requests 
+                         WHERE sender = ? AND receiver = ? AND status = 'pending' ''',
+                       (sender, username))
+        if not cursor.fetchone():
+            con.send("ERROR:No pending request from this user\n".encode())
+            return
+
+        if response.upper() == 'ACCEPT':
+            # Add to friendships
+            cursor.execute('INSERT INTO friendships VALUES (?, ?)', (sender, username))
+            # Remove from requests
+            cursor.execute('DELETE FROM friend_requests WHERE sender = ? AND receiver = ?',
+                           (sender, username))
+            conn.commit()
+            con.send("SUCCESS:Friend request accepted\n".encode())
+
+            # Notify the sender if they're online
+            if sender in connected_clients:
+                connected_clients[sender][0].send(f"NOTIFICATION:{username} accepted your friend request\n".encode())
+        else:
+            # Just remove the request
+            cursor.execute('DELETE FROM friend_requests WHERE sender = ? AND receiver = ?',
+                           (sender, username))
+            conn.commit()
+            con.send("SUCCESS:Friend request declined\n".encode())
+    except Exception as e:
+        con.send(f"ERROR:{str(e)}\n".encode())
+    finally:
+        conn.close()
+
+
+def get_pending_requests(username, con):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT sender FROM friend_requests WHERE receiver = ? AND status = "pending"',
+                       (username,))
+        requests = [row['sender'] for row in cursor.fetchall()]
+        con.send(f"REQUESTS:{','.join(requests)}\n".encode())
+    except Exception as e:
+        con.send(f"ERROR:{str(e)}\n".encode())
+    finally:
+        conn.close()
+
+
+def get_friends_list(username, con):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT user2 as friend FROM friendships WHERE user1 = ?
+                         UNION
+                         SELECT user1 as friend FROM friendships WHERE user2 = ?''',
+                       (username, username))
+        friends = [row['friend'] for row in cursor.fetchall()]
+        con.send(f"FRIENDS:{','.join(friends)}\n".encode())
+    except Exception as e:
+        con.send(f"ERROR:{str(e)}\n".encode())
+    finally:
+        conn.close()
+
 
 def save_public_key(username, pubkey):
     p, g, h = map(str, pubkey)
@@ -164,6 +278,7 @@ def save_public_key(username, pubkey):
     finally:
         conn.close()
 
+
 def get_public_key(username):
     conn = get_db_connection()
     try:
@@ -175,6 +290,7 @@ def get_public_key(username):
         return None
     finally:
         conn.close()
+
 
 def handle_message(sender, receiver, ciphertext, con):
     if receiver not in connected_clients:
@@ -270,6 +386,24 @@ def client_handler(con, addr):
                             con.send("ERROR:Invalid request\n".encode())
                             continue
                         handle_friend_request(username, parts[1], con)
+
+                    elif command == 'FRIEND_RESPONSE':
+                        if not username or len(parts) < 3:
+                            con.send("ERROR:Invalid request\n".encode())
+                            continue
+                        handle_friend_response(username, parts[1], parts[2], con)
+
+                    elif command == 'GET_REQUESTS':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        get_pending_requests(username, con)
+
+                    elif command == 'GET_FRIENDS':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        get_friends_list(username, con)
 
                     elif command == 'UPDATE_LOCATION':
                         if not username or len(parts) < 3:

@@ -90,7 +90,7 @@ def update_location(username, enc_x, enc_y):
 
 def handle_proximity_request(sender, target, con):
     try:
-        # Verify friendship (same as before)
+        # [1] Verify friendship
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''SELECT * FROM friendships 
@@ -101,47 +101,58 @@ def handle_proximity_request(sender, target, con):
             con.send("ERROR:Not friends\n".encode())
             return
 
-        # Get encrypted locations (same as before)
+        # [2] Get encrypted locations
         sender_loc = encrypted_locations.get(sender)
         target_loc = encrypted_locations.get(target)
         if not sender_loc or not target_loc:
             con.send("ERROR:Location unavailable\n".encode())
             return
 
-        # Parse coordinates (same as before)
-        s_x = tuple(map(int, sender_loc[0].split(',')))
-        s_y = tuple(map(int, sender_loc[1].split(',')))
-        t_x = tuple(map(int, target_loc[0].split(',')))
-        t_y = tuple(map(int, target_loc[1].split(',')))
+        # [3] Parse coordinates - remove debug prints
+        p = server_public_key[0]
+        try:
+            # Parse sender coordinates
+            s_x_parts = sender_loc[0].split(',')
+            s_y_parts = sender_loc[1].split(',')
+            s_x = (int(s_x_parts[0]), int(s_x_parts[1]))
+            s_y = (int(s_y_parts[0]), int(s_y_parts[1]))
 
-        # SIMPLIFIED APPROACH: Decrypt coordinates and calculate distance directly
-        # Decrypt the coordinates
+            # Parse target coordinates
+            t_x_parts = target_loc[0].split(',')
+            t_y_parts = target_loc[1].split(',')
+            t_x = (int(t_x_parts[0]), int(t_x_parts[1]))
+            t_y = (int(t_y_parts[0]), int(t_y_parts[1]))
+
+        except Exception as e:
+            # Remove debug print
+            con.send(f"ERROR:Invalid coordinate format\n".encode())
+            return
+
+        # [4] Decrypt coordinates to get actual values
         s_x_val = elgalmal.decrypt(server_private_key, s_x[0], s_x[1])
         s_y_val = elgalmal.decrypt(server_private_key, s_y[0], s_y[1])
         t_x_val = elgalmal.decrypt(server_private_key, t_x[0], t_x[1])
         t_y_val = elgalmal.decrypt(server_private_key, t_y[0], t_y[1])
 
-        # Print actual coordinates (for debugging)
-        print(f"Sender coordinates: ({s_x_val}, {s_y_val})")
-        print(f"Target coordinates: ({t_x_val}, {t_y_val})")
+        # [5] Calculate grid cell positions (each cell is 1000x1000 units)
+        # Make sure all values are integers
+        s_x_val = int(s_x_val)
+        s_y_val = int(s_y_val)
+        t_x_val = int(t_x_val)
+        t_y_val = int(t_y_val)
 
-        # Calculate the squared distance directly
-        dx = s_x_val - t_x_val
-        dy = s_y_val - t_y_val
-        dist_sq = dx * dx + dy * dy
+        s_cell_x = s_x_val // 1000
+        s_cell_y = s_y_val // 1000
+        t_cell_x = t_x_val // 1000
+        t_cell_y = t_y_val // 1000
 
-        print(f"dx: {dx}, dy: {dy}")
-        print(f"Squared distance: {dist_sq}")
-
-        # Compare with threshold
-        threshold = 1000000  # 1000^2
-        is_near = dist_sq <= threshold
-
-        print(f"Is nearby: {is_near}")
+        # [6] Users are nearby if they are in the same grid cell
+        is_near = (s_cell_x == t_cell_x) and (s_cell_y == t_cell_y)
 
         con.send(f"PROXIMITY:{str(is_near).upper()}\n".encode())
 
     except Exception as e:
+        # Keep error logging for server admin, but remove traceback
         print(f"Error in proximity check: {str(e)}")
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
@@ -152,6 +163,12 @@ def handle_friend_request(sender, target, con):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+
+        # Check if user is trying to add themselves
+        if sender == target:
+            con.send("ERROR:Cannot add yourself as a friend\n".encode())
+            return
+
         # Check if target user exists
         cursor.execute('SELECT * FROM user WHERE username = ?', (target,))
         if not cursor.fetchone():
@@ -382,6 +399,37 @@ def client_handler(con, addr):
                         else:
                             con.send("ERROR:Not logged in\n".encode())
 
+                    elif command == 'GET_LOCATION':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+
+                        # Get encrypted location
+                        user_loc = encrypted_locations.get(username)
+                        if not user_loc:
+                            con.send("ERROR:No location set\n".encode())
+                            continue
+
+                        try:
+                            # Parse coordinates
+                            x_enc = tuple(map(int, user_loc[0].split(',')))
+                            y_enc = tuple(map(int, user_loc[1].split(',')))
+
+                            # Decrypt coordinates
+                            x_val = elgalmal.decrypt(server_private_key, x_enc[0], x_enc[1])
+                            y_val = elgalmal.decrypt(server_private_key, y_enc[0], y_enc[1])
+
+                            # Calculate grid cell
+                            cell_x = x_val // 1000
+                            cell_y = y_val // 1000
+
+                            # Send response
+                            response = f"LOCATION:{x_val},{y_val}:{cell_x},{cell_y}\n"
+                            con.send(response.encode())
+
+                        except Exception as e:
+                            con.send(f"ERROR:Could not retrieve location: {str(e)}\n".encode())
+
                     elif command == 'REGISTER_PUBKEY':
                         if not username or len(parts) < 2:
                             con.send("ERROR:Login required\n".encode())
@@ -436,9 +484,14 @@ def client_handler(con, addr):
                         if not username or len(parts) < 3:
                             con.send("ERROR:Invalid coordinates\n".encode())
                             continue
+
                         x_str, y_str = parts[1], parts[2]
-                        update_location(username, x_str, y_str)
-                        con.send("SUCCESS:Location updated\n".encode())
+
+                        try:
+                            update_location(username, x_str, y_str)
+                            con.send("SUCCESS:Location updated\n".encode())
+                        except Exception as e:
+                            con.send(f"ERROR:Processing error: {str(e)}\n".encode())
 
                     elif command == 'PROXIMITY':
                         if not username or len(parts) < 2:

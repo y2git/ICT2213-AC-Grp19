@@ -58,7 +58,9 @@ class Client:
                     msg, buffer = buffer.split('\n', 1)
                     msg = msg.strip()
                     if msg:
-                        if msg.startswith(("SUCCESS:", "ERROR:", "PROXIMITY:", "PUBKEY:", "REQUESTS:", "FRIENDS:")):
+                        # Remove debug print
+                        if msg.startswith(
+                                ("SUCCESS:", "ERROR:", "PROXIMITY:", "PUBKEY:", "REQUESTS:", "FRIENDS:", "LOCATION:")):
                             with self.lock:
                                 self.response_queue.put(msg)
                         elif msg.startswith(("MESSAGE:", "NOTIFICATION:")):
@@ -102,10 +104,16 @@ class Client:
 
     def logout(self):
         if self.username:
-            response = self.send_command(f"LOGOUT:\n".encode())
+            response = self.send_command("LOGOUT:\n".encode())
             self.username = None
-            return response.startswith("SUCCESS")
-        return False
+            return response
+        return "ERROR:Not logged in"
+
+    def get_current_location(self):
+        if not self.username:
+            return "ERROR:Not logged in"
+
+        return self.send_command("GET_LOCATION:\n".encode())
 
     def get_friend_pubkey(self, friend):
         if friend in self.friend_pubkeys:
@@ -133,9 +141,18 @@ class Client:
 
     def update_location(self, x, y):
         try:
+            x = int(x)
+            y = int(y)
+
+            # Validate coordinates are within the valid range
+            if not (0 <= x <= 99999 and 0 <= y <= 99999):
+                return "ERROR:Coordinates must be between 0 and 99999"
+
             c1, c2 = elgalmal.encrypt(self.server_pubkey, x)
             c3, c4 = elgalmal.encrypt(self.server_pubkey, y)
             return self.send_command(f"UPDATE_LOCATION:{c1},{c2}:{c3},{c4}\n".encode())
+        except ValueError:
+            return "ERROR:Coordinates must be valid numbers"
         except Exception as e:
             return f"ERROR:{str(e)}"
 
@@ -272,26 +289,31 @@ def main():
                 password = masked_input()
             print(client.register(username, password))
 
-
         elif choice == '2':
             username = input("Username: ").strip()
-            # Try to use getpass, fall back to input if it fails
             try:
                 print("Password: ", end='', flush=True)
                 password = getpass.getpass("")
             except Exception:
-                # If getpass fails, use input with a custom masking function
                 password = masked_input()
             if client.login(username, password):
                 print("Login successful!")
                 while True:
                     try:
-                        x = int(input("Initial X: "))
-                        y = int(input("Initial Y: "))
-                        if "SUCCESS" in client.update_location(x, y):
+                        print("Please enter coordinates (0-99999):")
+                        x = int(input("X: "))
+                        y = int(input("Y: "))
+                        # Validate input range
+                        if not (0 <= x <= 99999 and 0 <= y <= 99999):
+                            print("Error: Coordinates must be between 0 and 99999")
+                            continue
+                        result = client.update_location(x, y)
+                        if "SUCCESS" in result:
                             break
+                        else:
+                            print(result)
                     except ValueError:
-                        print("Invalid coordinates")
+                        print("Invalid coordinates. Please enter numeric values.")
                 break
 
         elif choice == '3':
@@ -303,7 +325,8 @@ def main():
     # Main menu
     while client.running:
         client.print_messages()
-        print("\n1. Friend Management\n2. Update Location\n3. Check Proximity\n4. Send Message\n5. Exit")
+        print("\n1. Friend Management\n2. Update Location\n3. Check Proximity\n4. Send Message\n5. Check My Location\n"
+              "6. Logout")
         choice = input("Choice: ").strip()
 
         if choice == '1':
@@ -367,11 +390,19 @@ def main():
 
         elif choice == '2':
             try:
+                print("Please enter coordinates (0-99999):")
                 x = int(input("X: "))
                 y = int(input("Y: "))
-                print(client.update_location(x, y))
+
+                # Validate input range
+                if not (0 <= x <= 99999 and 0 <= y <= 99999):
+                    print("Error: Coordinates must be between 0 and 99999")
+                    continue
+
+                result = client.update_location(x, y)
+                print(result)
             except ValueError:
-                print("Invalid coordinates")
+                print("Invalid coordinates. Please enter numeric values.")
 
         elif choice == '3':
             # First, get the list of friends
@@ -417,12 +448,29 @@ def main():
                 print(response)
 
         elif choice == '5':
+            print("Checking your current location...")
+            response = client.get_current_location()
+
+            if response.startswith("LOCATION:"):
+                try:
+                    parts = response.split(':')
+                    coords = parts[1].split(',')
+                    cell = parts[2].split(',')
+                    print(f"\nYour current location:")
+                    print(f"Coordinates: ({coords[0]}, {coords[1]})")
+                    print(f"Grid cell: ({cell[0]}, {cell[1]})")
+                except Exception as e:
+                    print(f"Error parsing location data: {e}")
+            else:
+                print(response)
+
+        elif choice == '6':
+            if client.username:  # If user is logged in
+                logout_response = client.send_command("LOGOUT:\n".encode())
+                print(f"Logging out: {logout_response}")
             client.running = False
             client.sock.close()
             print("Goodbye!")
-
-        else:
-            print("Invalid choice")
 
 
 if __name__ == "__main__":

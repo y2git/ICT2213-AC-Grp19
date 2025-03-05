@@ -93,6 +93,18 @@ class Client:
             pubkey_str = f"{self.public_key[0]},{self.public_key[1]},{self.public_key[2]}"
             self.send_command(f"REGISTER_PUBKEY:{pubkey_str}\n".encode())
             return True
+        elif response.startswith("ERROR"):
+            # Extract and print the error message from the server
+            error_msg = response.split(':', 1)[1] if ':' in response else "Login failed"
+            print(f"Error: {error_msg}")
+            return False
+        return False
+
+    def logout(self):
+        if self.username:
+            response = self.send_command(f"LOGOUT:\n".encode())
+            self.username = None
+            return response.startswith("SUCCESS")
         return False
 
     def get_friend_pubkey(self, friend):
@@ -260,6 +272,7 @@ def main():
                 password = masked_input()
             print(client.register(username, password))
 
+
         elif choice == '2':
             username = input("Username: ").strip()
             # Try to use getpass, fall back to input if it fails
@@ -284,7 +297,6 @@ def main():
         elif choice == '3':
             client.running = False
             return
-
         else:
             print("Invalid choice")
 

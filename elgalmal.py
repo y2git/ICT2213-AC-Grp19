@@ -39,7 +39,6 @@ def homomorphic_multiply(c, scalar, p):
 
 def homomorphic_compare(dist_sq, enc_threshold, p, private_key):
     """Compare encrypted distances"""
-    # Decrypt both values using server's private key
     decrypted_dist = decrypt(private_key, dist_sq[0], dist_sq[1])
     decrypted_thresh = decrypt(private_key, enc_threshold[0], enc_threshold[1])
-    return decrypted_dist < decrypted_thresh
+    return decrypted_dist <= decrypted_thresh

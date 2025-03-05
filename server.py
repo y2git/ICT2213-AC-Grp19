@@ -90,7 +90,7 @@ def update_location(username, enc_x, enc_y):
 
 def handle_proximity_request(sender, target, con):
     try:
-        # [1] Verify friendship
+        # Verify friendship (same as before)
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''SELECT * FROM friendships 
@@ -101,35 +101,48 @@ def handle_proximity_request(sender, target, con):
             con.send("ERROR:Not friends\n".encode())
             return
 
-        # [2] Get encrypted locations
+        # Get encrypted locations (same as before)
         sender_loc = encrypted_locations.get(sender)
         target_loc = encrypted_locations.get(target)
         if not sender_loc or not target_loc:
             con.send("ERROR:Location unavailable\n".encode())
             return
 
-        # [3] Parse coordinates
-        p = server_public_key[0]
+        # Parse coordinates (same as before)
         s_x = tuple(map(int, sender_loc[0].split(',')))
         s_y = tuple(map(int, sender_loc[1].split(',')))
         t_x = tuple(map(int, target_loc[0].split(',')))
         t_y = tuple(map(int, target_loc[1].split(',')))
 
-        # [4] Calculate squared distance
-        dx = elgalmal.homomorphic_subtract(s_x, t_x, p)
-        dy = elgalmal.homomorphic_subtract(s_y, t_y, p)
-        dx_sq = elgalmal.homomorphic_multiply(dx, 2, p)
-        dy_sq = elgalmal.homomorphic_multiply(dy, 2, p)
-        dist_sq = elgalmal.homomorphic_add(dx_sq, dy_sq, p)
+        # SIMPLIFIED APPROACH: Decrypt coordinates and calculate distance directly
+        # Decrypt the coordinates
+        s_x_val = elgalmal.decrypt(server_private_key, s_x[0], s_x[1])
+        s_y_val = elgalmal.decrypt(server_private_key, s_y[0], s_y[1])
+        t_x_val = elgalmal.decrypt(server_private_key, t_x[0], t_x[1])
+        t_y_val = elgalmal.decrypt(server_private_key, t_y[0], t_y[1])
 
-        # [5] Compare with threshold (1000^2 = 1,000,000)
-        threshold = 1000000
-        enc_threshold = elgalmal.encrypt(server_public_key, threshold)
-        is_near = elgalmal.homomorphic_compare(dist_sq, enc_threshold, p, server_private_key)
+        # Print actual coordinates (for debugging)
+        print(f"Sender coordinates: ({s_x_val}, {s_y_val})")
+        print(f"Target coordinates: ({t_x_val}, {t_y_val})")
+
+        # Calculate the squared distance directly
+        dx = s_x_val - t_x_val
+        dy = s_y_val - t_y_val
+        dist_sq = dx * dx + dy * dy
+
+        print(f"dx: {dx}, dy: {dy}")
+        print(f"Squared distance: {dist_sq}")
+
+        # Compare with threshold
+        threshold = 1000000  # 1000^2
+        is_near = dist_sq <= threshold
+
+        print(f"Is nearby: {is_near}")
 
         con.send(f"PROXIMITY:{str(is_near).upper()}\n".encode())
 
     except Exception as e:
+        print(f"Error in proximity check: {str(e)}")
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
         conn.close()
@@ -347,13 +360,27 @@ def client_handler(con, addr):
                         if len(parts) < 3:
                             con.send("ERROR:Missing fields\n".encode())
                             continue
-                        username, password = parts[1], parts[2]
-                        if login_user(username, password):
+                        username_attempt, password = parts[1], parts[2]
+                        # Check if user is already logged in
+                        if username_attempt in connected_clients:
+                            con.send("ERROR:User already logged in\n".encode())
+                            continue
+                        if login_user(username_attempt, password):
+                            username = username_attempt
                             connected_clients[username] = (con, addr)
                             con.send("SUCCESS:Logged in\n".encode())
                             print(f"User {username} logged in from {addr}")
                         else:
                             con.send("ERROR:Invalid credentials\n".encode())
+
+                    elif command == 'LOGOUT':
+                        if username and username in connected_clients:
+                            del connected_clients[username]
+                            con.send("SUCCESS:Logged out\n".encode())
+                            print(f"User {username} logged out")
+                            username = None
+                        else:
+                            con.send("ERROR:Not logged in\n".encode())
 
                     elif command == 'REGISTER_PUBKEY':
                         if not username or len(parts) < 2:

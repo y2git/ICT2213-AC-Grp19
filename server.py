@@ -7,9 +7,8 @@ import elgamal
 import hashlib
 import os
 import base64
-import json
-import queue
 from crypto_utils import deserialize_ciphertext, int_to_string, string_to_int, serialize_ciphertext
+
 
 server_PORT = 60
 server_IP = '127.0.0.1'
@@ -24,11 +23,13 @@ server_private_key = None
 connected_clients = {}
 client_public_keys = {}  # Store client public keys
 
+
 def hash_password(password):
     salt = os.urandom(32)
     key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
     storage_format = base64.b64encode(salt + key).decode('utf-8')
     return storage_format
+
 
 def verify_password(stored_password, provided_password):
     try:
@@ -39,6 +40,7 @@ def verify_password(stored_password, provided_password):
         return hashlib.compare_digest(key, stored_key)
     except Exception:
         return False
+
 
 def init_db():
     conn = sqlite3.connect('test.db', check_same_thread=False)
@@ -67,6 +69,11 @@ def init_db():
                           g TEXT,
                           h TEXT,
                           FOREIGN KEY(username) REFERENCES user(username))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS paillier_public_keys
+                         (username TEXT PRIMARY KEY,
+                          n TEXT,
+                          g TEXT,
+                          FOREIGN KEY(username) REFERENCES user(username))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS offline_friend_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender TEXT,
@@ -78,15 +85,18 @@ def init_db():
     finally:
         conn.close()
 
+
 def generate_global_keys():
     global server_public_key, server_private_key
     server_public_key, server_private_key = elgamal.generate_keys()
     print("Encryption keys generated: ElGamal keys for general encryption")
 
+
 def get_db_connection():
     conn = sqlite3.connect('test.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def login_user(username, password):
     conn = get_db_connection()
@@ -191,11 +201,70 @@ def handle_get_friend_location(username, friend, con):
         if 'conn' in locals():
             conn.close()
 
-def handle_proximity_message(from_user, to_user, message_type, session_id, data, con=None):
-    # Proximity functionality has been removed.
-    if con:
-        con.send("ERROR:Proximity functionality removed\n".encode())
-    return False
+
+def handle_proximity_request(sender, target, encrypted_loc_str, paillier_pubkey_str, con):
+    """Route a proximity request from sender to target with improved handling for large data"""
+    log_action(sender, "PROXIMITY_REQUEST", f"to {target}")
+
+    # Check if target is a friend
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''SELECT * FROM friendships 
+                         WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)''',
+                       (sender, target, target, sender))
+        if not cursor.fetchone():
+            con.send("ERROR:You are not friends with this user\n".encode())
+            return False
+
+        # Check if target is online
+        if target in connected_clients:
+            # Forward the request to the target
+            to_con = connected_clients[target][0]
+
+            # For large payloads, we should construct and send the message carefully
+            message_to_forward = f"PROXIMITY_REQUEST:{sender}:{encrypted_loc_str}:{paillier_pubkey_str}\n"
+
+            try:
+                print(f"Forwarding proximity request from {sender} to {target}")
+                print(f"Message length: {len(message_to_forward)}")
+
+                # Send the message in chunks if it's very large
+                if len(message_to_forward) > 60000:  # If approaching buffer size limit
+                    print(f"WARNING: Very large proximity request message ({len(message_to_forward)} bytes)")
+
+                to_con.send(message_to_forward.encode())
+                con.send("SUCCESS:Proximity request sent\n".encode())
+                return True
+            except Exception as e:
+                print(f"Error forwarding proximity request: {e}")
+                con.send(f"ERROR:Failed to forward request: {str(e)}\n".encode())
+                return False
+        else:
+            con.send("ERROR:Friend is not online\n".encode())
+            return False
+    except Exception as e:
+        con.send(f"ERROR:{str(e)}\n".encode())
+        return False
+    finally:
+        conn.close()
+
+
+def handle_proximity_result(sender, target, encrypted_result_str, con):
+    """Route a proximity calculation result from sender back to the requester (target)"""
+    log_action(sender, "PROXIMITY_RESULT", f"to {target}")
+
+    # Only forward to the target if they're online
+    if target in connected_clients:
+        to_con = connected_clients[target][0]
+        message_to_forward = f"PROXIMITY_RESULT:{sender}:{encrypted_result_str}\n"
+        to_con.send(message_to_forward.encode())
+        con.send("SUCCESS:Proximity result sent\n".encode())
+        return True
+    else:
+        con.send("ERROR:Recipient is no longer online\n".encode())
+        return False
+
 
 def handle_friend_request(sender, target, con):
     conn = get_db_connection()
@@ -238,6 +307,7 @@ def handle_friend_request(sender, target, con):
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
         conn.close()
+
 
 def handle_friend_response(username, sender, response, con):
     conn = get_db_connection()
@@ -288,6 +358,7 @@ def get_pending_requests(username, con):
     finally:
         conn.close()
 
+
 def get_friends_list(username, con):
     conn = get_db_connection()
     try:
@@ -301,6 +372,7 @@ def get_friends_list(username, con):
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
         conn.close()
+
 
 def save_public_key(username, pubkey):
     p, g, h = map(str, pubkey)
@@ -317,6 +389,23 @@ def save_public_key(username, pubkey):
     finally:
         conn.close()
 
+
+def save_paillier_public_key(username, pubkey):
+    n, g = map(str, pubkey)
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO paillier_public_keys (username, n, g) VALUES (?, ?, ?)',
+                      (username, n, g))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving Paillier public key: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+
 def get_public_key(username):
     conn = get_db_connection()
     try:
@@ -329,9 +418,24 @@ def get_public_key(username):
     finally:
         conn.close()
 
+
+def get_paillier_public_key(username):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT n, g FROM paillier_public_keys WHERE username = ?', (username,))
+        result = cursor.fetchone()
+        if result:
+            return (int(result['n']), int(result['g']))
+        return None
+    finally:
+        conn.close()
+
+
 def log_action(username, action, details=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] USER: {username.ljust(15)} ACTION: {action.ljust(20)} DETAILS: {details}")
+
 
 def client_handler(con, addr):
     print(f'New connection from {addr}')
@@ -403,13 +507,6 @@ def client_handler(con, addr):
                         con.send("ERROR:Username exists\n".encode())
                     continue
 
-                # # For any friend management or proximity commands, return an error since they have been removed.
-                # elif msg.startswith(("PROXIMITY_REQUEST:", "PROXIMITY_RESPONSE:",
-                #                      "YAO_CIRCUIT:", "YAO_OT_INIT:",
-                #                      "YAO_OT_COMPLETE:", "YAO_INPUTS:", "YAO_RESULT:")):
-                #     parts = msg.split(':', 3)
-                #     con.send("ERROR:Proximity functionality removed\n".encode())
-                #     continue
                 else:
                     parts = msg.strip().split(':', 2)
                 if not parts:
@@ -473,6 +570,25 @@ def client_handler(con, addr):
                         else:
                             con.send("ERROR:Failed to save public key\n".encode())
 
+                    elif command == 'REGISTER_PAILLIER_PUBKEY':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        # Parse the Paillier public key from the message
+                        paillier_pubkey_str = parts[1]
+                        try:
+                            pubkey_parts = paillier_pubkey_str.split(',')
+                            if len(pubkey_parts) != 2:
+                                con.send("ERROR:Invalid Paillier public key format\n".encode())
+                                continue
+                            paillier_pubkey = tuple(map(int, pubkey_parts))
+                            if save_paillier_public_key(username, paillier_pubkey):
+                                con.send(f"SUCCESS:Paillier public key registered\n".encode())
+                                log_action(username, "REGISTER_PAILLIER_PUBKEY")
+                            else:
+                                con.send("ERROR:Failed to save Paillier public key\n".encode())
+                        except Exception as e:
+                            con.send(f"ERROR:Invalid Paillier public key values: {str(e)}\n".encode())
 
                     elif command == 'GET_PUBKEY':
                         if not username or len(parts) < 2:
@@ -485,6 +601,22 @@ def client_handler(con, addr):
                             con.send(f"PUBKEY:{target}:{client_pubkey_str}\n".encode())
                         else:
                             con.send(f"ERROR:No public key for {target}\n".encode())
+
+                    elif command == 'GET_PAILLIER_PUBKEY':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        if len(parts) < 2:
+                            con.send("ERROR:Missing target username\n".encode())
+                            continue
+                        target = parts[1]
+                        pubkey = get_paillier_public_key(target)
+                        if pubkey:
+                            paillier_pubkey_str = f"{pubkey[0]},{pubkey[1]}"
+                            con.send(f"PAILLIER_PUBKEY:{target}:{paillier_pubkey_str}\n".encode())
+                            log_action(username, "GET_PAILLIER_PUBKEY", f"for {target}")
+                        else:
+                            con.send(f"ERROR:No Paillier public key for {target}\n".encode())
 
                     elif command == "EFRIEND_RESPONSE":
                         print("DEBUG: Raw friend management message:", msg)
@@ -651,6 +783,7 @@ def client_handler(con, addr):
                             if query != "GET_FRIENDS":
                                 con.send("ERROR:Invalid query\n".encode())
                                 continue
+
                         except Exception as e:
                             con.send("ERROR:Decryption failed\n".encode())
                             continue
@@ -676,6 +809,55 @@ def client_handler(con, addr):
                         else:
                             con.send("ERROR:No public key registered\n".encode())
                         continue
+
+                    elif command == 'PROXIMITY_REQUEST':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        try:
+                            if len(parts) < 2:
+                                con.send("ERROR:Missing target friend\n".encode())
+                                continue
+                            target = parts[1]
+                            original_msg = msg.strip()
+                            prefix = f"PROXIMITY_REQUEST:{target}:"
+
+                            if not original_msg.startswith(prefix):
+                                con.send("ERROR:Invalid message format\n".encode())
+                                continue
+
+                            rest_of_msg = original_msg[len(prefix):]
+                            last_colon_pos = rest_of_msg.rfind(':')
+
+                            if last_colon_pos == -1:
+                                con.send("ERROR:Invalid proximity request format - missing data\n".encode())
+                                continue
+
+                            encrypted_loc_str = rest_of_msg[:last_colon_pos]
+                            paillier_pubkey_str = rest_of_msg[last_colon_pos + 1:]
+                            print(f"Proximity request from {username} to {target}")
+                            print(f"Encrypted location length: {len(encrypted_loc_str)}")
+                            print(f"Public key length: {len(paillier_pubkey_str)}")
+
+                            # Forward the request
+                            handle_proximity_request(username, target, encrypted_loc_str, paillier_pubkey_str, con)
+
+                        except Exception as e:
+                            print(f"Error handling proximity request: {e}")
+                            con.send(f"ERROR:Processing error: {str(e)}\n".encode())
+
+                    elif command == 'PROXIMITY_RESULT':
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        if len(parts) < 3:
+                            con.send("ERROR:Invalid proximity result format\n".encode())
+                            continue
+
+                        target = parts[1]
+                        encrypted_result_str = parts[2]
+
+                        handle_proximity_result(username, target, encrypted_result_str, con)
 
                     elif command == 'UPDATE_LOCATION':
                         if not username:
@@ -718,17 +900,17 @@ def client_handler(con, addr):
         print(f"{addr} disconnected")
 
 
-
 if __name__ == "__main__":
     init_db()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((server_IP, server_PORT))
     s.listen(5)
     generate_global_keys()
-    print("\nHybrid Encryption Location Sharing Server")
+    print("\nSecure Location Sharing Server")
     print("=========================================")
     print("ElGamal: Used for general encryption (login, friend requests)")
-    print("Proximity functionality removed")
+    print("Paillier: Used for privacy-preserving proximity checks")
+    print("Server acts as a relay for encrypted messages")
     print("Server Online - Waiting for connections...")
 
     try:

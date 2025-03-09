@@ -5,14 +5,42 @@ import time
 import getpass
 import sys
 import json
-import base64
 import elgamal
 import crypto_utils
 import os
+import paillier
 
 target_PORT = 60
 target_IP = '127.0.0.1'
 BUF_SIZE = 65536
+PROXIMITY_THRESHOLD = 2500  # Proximity threshold for Euclidean distance squared
+
+
+def parse_paillier_pubkey(key_str):
+    """Safely parse a Paillier public key string into a tuple (n, g)"""
+    try:
+        # Clean up the string
+        key_str = key_str.strip()
+
+        # The key string might have newlines or spaces - remove them
+        key_str = key_str.replace('\n', '').replace(' ', '')
+
+        # Split by comma
+        parts = key_str.split(',')
+        if len(parts) != 2:
+            print(f"Error: Expected 2 parts in Paillier key, got {len(parts)}")
+            return None
+
+        # Parse integers
+        n = int(parts[0])
+        g = int(parts[1])
+        return (n, g)
+    except ValueError as e:
+        print(f"Error parsing Paillier key integers: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error parsing Paillier key: {e}")
+        return None
 
 class Client:
     def __init__(self):
@@ -24,12 +52,13 @@ class Client:
         self.public_key = None     # Client's ElGamal public key
         self.private_key = None    # Client's ElGamal private key
 
-        if self.public_key and self.private_key:
-            print(f"DEBUG: Generated private key: {self.private_key}")
-            print(f"DEBUG: Generated public key: {self.public_key}")
+        # Paillier encryption (for proximity checks)
+        self.paillier_public_key = None
+        self.paillier_private_key = None
 
         # Friend's public keys
-        self.friend_pubkeys = {}
+        self.friend_pubkeys = {}  # ElGamal
+        self.friend_paillier_pubkeys = {}  # Paillier
 
         # Location state
         self.current_location = None
@@ -56,28 +85,6 @@ class Client:
                 # Get server's ElGamal public key
                 p, g, h = map(int, data.split(':')[1].split(','))
                 self.server_pubkey = (p, g, h)
-
-
-                # Add the ElGamal self-test code here
-                # # Test ElGamal encryption/decryption
-                # test_message = "Test message"
-                # test_int = crypto_utils.string_to_int(test_message)
-                # print(f"Test message as int: {test_int}")
-                #
-                # # Encrypt with own public key
-                # test_encrypted = elgamal.encrypt(self.public_key, test_int)
-                # print(f"Encrypted with own public key: {test_encrypted}")
-                #
-                # # Decrypt with own private key
-                # test_decrypted = elgamal.decrypt(self.private_key, test_encrypted[0], test_encrypted[1])
-                # print(f"Decrypted int: {test_decrypted}")
-                # test_decrypted_str = crypto_utils.int_to_string(test_decrypted)
-                # print(f"Decrypted message: {test_decrypted_str}")
-                #
-                # if test_decrypted_str == test_message:
-                #     print("ElGamal self-test PASSED")
-                # else:
-                #     print("ElGamal self-test FAILED")
             return True
         except Exception as e:
             print(f"Connection error: {str(e)}")
@@ -90,9 +97,16 @@ class Client:
             if os.path.exists(key_file):
                 with open(key_file, 'r') as f:
                     keys = json.load(f)
-                    self.public_key = tuple(keys['public_key'])
-                    self.private_key = tuple(keys['private_key'])
-                    print(f"Loaded existing keys for {username}")
+                    self.public_key = tuple(keys['elgamal_public_key'])
+                    self.private_key = tuple(keys['elgamal_private_key'])
+
+                    # Load Paillier keys if they exist
+                    if 'paillier_public_key' in keys and 'paillier_private_key' in keys:
+                        self.paillier_public_key = tuple(keys['paillier_public_key'])
+                        self.paillier_private_key = tuple(keys['paillier_private_key'])
+                        print(f"Loaded existing ElGamal and Paillier keys for {username}")
+                    else:
+                        print(f"Loaded existing ElGamal keys for {username}, but no Paillier keys")
                     return True
             return False
         except Exception as e:
@@ -106,18 +120,23 @@ class Client:
 
         key_file = f"{self.username}_keys.json"
         try:
+            keys = {
+                'elgamal_public_key': list(self.public_key),
+                'elgamal_private_key': list(self.private_key),
+            }
+
+            # Add Paillier keys if they exist
+            if self.paillier_public_key and self.paillier_private_key:
+                keys['paillier_public_key'] = list(self.paillier_public_key)
+                keys['paillier_private_key'] = list(self.paillier_private_key)
+
             with open(key_file, 'w') as f:
-                keys = {
-                    'public_key': list(self.public_key),
-                    'private_key': list(self.private_key)
-                }
                 json.dump(keys, f)
                 print(f"Saved keys for {self.username}")
             return True
         except Exception as e:
             print(f"Error saving keys: {e}")
             return False
-
 
     def receive_handler(self):
         buffer = ""
@@ -130,9 +149,66 @@ class Client:
                 while '\n' in buffer:
                     msg, buffer = buffer.split('\n', 1)
                     msg = msg.strip()
-                    print(f"DEBUG: Received raw message: {msg}")  # Add this line
-                    # Check for encrypted friend management commands.
-                    if msg.startswith("EADD_FRIEND:") or msg.startswith("EFRIEND_RESPONSE:"):
+                    print(f"DEBUG: Received raw message: {msg}")
+
+                    # Handle proximity check messages
+                    if msg.startswith("PROXIMITY_REQUEST:"):
+                        parts = msg.split(":", 3)
+                        if len(parts) < 4:
+                            print("Invalid proximity request format")
+                            continue
+                        sender = parts[1]
+                        encrypted_loc_str = parts[2]
+                        paillier_pubkey_str = parts[3]
+
+                        print(f"\nReceived proximity check request from {sender}")
+                        self.handle_proximity_request(sender, encrypted_loc_str, paillier_pubkey_str)
+                        continue
+
+                    elif msg.startswith("PROXIMITY_RESULT:"):
+                        parts = msg.split(":", 2)
+                        if len(parts) < 3:
+                            print("Invalid proximity result format")
+                            continue
+                        sender = parts[1]
+                        encrypted_result_str = parts[2]
+
+                        print(f"\nReceived proximity check result from {sender}")
+                        self.handle_proximity_result(sender, encrypted_result_str)
+                        continue
+
+
+                    elif msg.startswith("PAILLIER_PUBKEY:"):
+                        try:
+                            parts = msg.split(":", 3)  # Allow for more parts in case key contains colons
+                            if len(parts) < 3:
+                                print("Invalid Paillier public key format")
+                                continue
+                            friend = parts[1]
+                            # The key might be split across multiple parts if it contains colons
+                            pubkey_str = ':'.join(parts[2:])
+                            # Try to parse the key to validate it
+                            key_parts = pubkey_str.strip().split(',')
+                            if len(key_parts) == 2:
+                                try:
+                                    n = int(key_parts[0])
+                                    g = int(key_parts[1])
+                                    self.friend_paillier_pubkeys[friend] = (n, g)
+                                    print(f"Received and cached Paillier public key for {friend}")
+                                    self.message_queue.put(f"Received Paillier public key for {friend}")
+                                    # Also put the message in the response queue for send_command to find
+                                    with self.lock:
+                                        self.response_queue.put(msg)
+                                except ValueError:
+                                    print("Failed to parse Paillier key integers")
+                            else:
+                                print(f"Invalid Paillier key format: expected 2 parts, got {len(key_parts)}")
+                        except Exception as e:
+                            print(f"Error processing Paillier public key: {e}")
+                        continue
+
+                    # Handle other message types
+                    elif msg.startswith("EADD_FRIEND:") or msg.startswith("EFRIEND_RESPONSE:"):
                         parts = msg.split(":", 2)
                         print(f"DEBUG: Friend command parts: {parts}, length: {len(parts)}")
                         if len(parts) < 3:
@@ -193,14 +269,49 @@ class Client:
         try:
             with self.lock:
                 self.response_queue.queue.clear()
+
+            # Convert command to string for easier handling
             if isinstance(command, bytes):
-                if not command.endswith(b'\n'):
-                    command += b'\n'
-                self.sock.send(command)
+                cmd_str = command.decode('utf-8')
+                if not cmd_str.endswith('\n'):
+                    cmd_str += '\n'
+                command_bytes = cmd_str.encode('utf-8')
             else:
-                if not command.endswith('\n'):
-                    command += '\n'
-                self.sock.send(command.encode())
+                cmd_str = command
+                if not cmd_str.endswith('\n'):
+                    cmd_str += '\n'
+                command_bytes = cmd_str.encode('utf-8')
+
+            # Send the command
+            self.sock.send(command_bytes)
+
+            # Special handling for GET_PAILLIER_PUBKEY
+            if "GET_PAILLIER_PUBKEY:" in cmd_str:
+                print("Waiting for PAILLIER_PUBKEY response...")
+                # Extract the friend name from the command
+                friend = cmd_str.split(":")[1].strip()
+                if friend.endswith('\n'):
+                    friend = friend[:-1]
+
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    with self.lock:
+                        if not self.response_queue.empty():
+                            response = self.response_queue.get()
+                            # Check if this is the response we're looking for
+                            if isinstance(response, str) and response.startswith(f"PAILLIER_PUBKEY:{friend}:"):
+                                return response
+                    time.sleep(0.1)
+
+                # If we reach here, we've timed out waiting for the specific response
+                if friend in self.friend_paillier_pubkeys:
+                    # If we have a cached key, construct a response manually
+                    pubkey = self.friend_paillier_pubkeys[friend]
+                    pubkey_str = f"{pubkey[0]},{pubkey[1]}"
+                    return f"PAILLIER_PUBKEY:{friend}:{pubkey_str}"
+                return "ERROR:Timeout waiting for PAILLIER_PUBKEY response"
+
+            # For other commands, use the standard response handling
             start_time = time.time()
             while time.time() - start_time < timeout:
                 with self.lock:
@@ -209,6 +320,9 @@ class Client:
                 time.sleep(0.1)
             return "ERROR:Timeout waiting for response"
         except Exception as e:
+            print(f"Exception in send_command: {e}")
+            import traceback
+            traceback.print_exc()
             return f"ERROR:{str(e)}"
 
     # Authentication Functions
@@ -219,34 +333,60 @@ class Client:
         return self.send_command(f"EREGISTER:{encrypted_payload}\n".encode())
 
     def login(self, username, password):
-        # Encrypt the credentials before sending
-        encrypted_credentials = self.encrypt_credentials(username, password)
+        """Login with improved error handling"""
+        try:
+            # Encrypt the credentials before sending
+            encrypted_credentials = self.encrypt_credentials(username, password)
 
-        # Send with a special prefix to indicate encryption, e.g., "ELOGIN:"
-        response = self.send_command(f"ELOGIN:{encrypted_credentials}\n".encode())
-        if response.startswith("SUCCESS"):
-            self.username = username
+            # Send with a special prefix to indicate encryption, e.g., "ELOGIN:"
+            response = self.send_command(f"ELOGIN:{encrypted_credentials}")
 
-            # Try to load existing keys
-            if not self.load_keys(username):
-                # If no keys exist, generate new ones
-                self.public_key, self.private_key = elgamal.generate_keys()
-                print(f"Generated new keys for {username}")
-                print(f"DEBUG: Private key: {self.private_key}")
-                print(f"DEBUG: Public key: {self.public_key}")
-                # Save the newly generated keys
-                self.save_keys()
+            print(f"DEBUG: Login response: {response}")
 
-            # Always register the public key with the server after login
-            pubkey_str = f"{self.public_key[0]},{self.public_key[1]},{self.public_key[2]}"
-            print("Sending REGISTER_PUBKEY with:", pubkey_str)
-            self.send_command(f"REGISTER_PUBKEY:{pubkey_str}")
-            return True
-        elif response.startswith("ERROR"):
-            error_msg = response.split(':', 1)[1] if ':' in response else "Login failed"
-            print(f"Error: {error_msg}")
+            # Ensure response is a string
+            if not isinstance(response, str):
+                print(f"ERROR: Expected string response, got {type(response)}")
+                return False
+
+            if response.startswith("SUCCESS"):
+                self.username = username
+
+                # Try to load existing keys
+                if not self.load_keys(username):
+                    # If no keys exist, generate new ones
+                    self.public_key, self.private_key = elgamal.generate_keys()
+                    # Generate Paillier keys for proximity checks
+                    self.paillier_public_key, self.paillier_private_key = paillier.generate_keys()
+                    print(f"Generated new ElGamal and Paillier keys for {username}")
+                    # Save the newly generated keys
+                    self.save_keys()
+
+                # Always register the public keys with the server after login
+
+                # Register ElGamal public key
+                pubkey_str = f"{self.public_key[0]},{self.public_key[1]},{self.public_key[2]}"
+                print("Sending REGISTER_PUBKEY with:", pubkey_str)
+                self.send_command(f"REGISTER_PUBKEY:{pubkey_str}")
+
+                # Register Paillier public key
+                if self.paillier_public_key:
+                    paillier_pubkey_str = f"{self.paillier_public_key[0]},{self.paillier_public_key[1]}"
+                    print("Sending REGISTER_PAILLIER_PUBKEY with:", paillier_pubkey_str)
+                    self.send_command(f"REGISTER_PAILLIER_PUBKEY:{paillier_pubkey_str}")
+
+                return True
+            elif response.startswith("ERROR"):
+                error_msg = response.split(':', 1)[1] if ':' in response else "Login failed"
+                print(f"Error: {error_msg}")
+                return False
+            else:
+                print(f"Unexpected response format: {response}")
+                return False
+        except Exception as e:
+            print(f"Exception during login: {e}")
+            import traceback
+            traceback.print_exc()
             return False
-        return False
 
     def logout(self):
         if self.username:
@@ -278,6 +418,46 @@ class Client:
             except Exception as e:
                 print("Error parsing public key:", e)
                 return None
+        return None
+
+    def get_friend_paillier_pubkey(self, friend):
+        """Get a friend's Paillier public key with improved parsing"""
+        if friend in self.friend_paillier_pubkeys:
+            print(f"DEBUG: Using cached Paillier public key for {friend}")
+            return self.friend_paillier_pubkeys[friend]
+
+        print(f"DEBUG: Requesting Paillier public key for {friend} from server")
+        response = self.send_command(f"GET_PAILLIER_PUBKEY:{friend}\n".encode())
+        print(f"DEBUG: Raw PAILLIER_PUBKEY response: {response}")
+
+        if response.startswith("PAILLIER_PUBKEY:"):
+            try:
+                # Split only on the first two colons - the key itself might contain colons
+                parts = response.split(':', 2)
+                if len(parts) < 3:
+                    print(f"Error: Invalid Paillier public key format - not enough parts")
+                    return None
+
+                public_key_str = parts[2]
+                print(f"DEBUG: Attempting to parse public key string...")
+
+                # Use our safe parsing function
+                friend_pubkey = parse_paillier_pubkey(public_key_str)
+                if friend_pubkey:
+                    print(f"DEBUG: Successfully parsed Paillier public key for {friend}")
+                    self.friend_paillier_pubkeys[friend] = friend_pubkey
+                    return friend_pubkey
+                else:
+                    print(f"Failed to parse Paillier public key")
+                    return None
+
+            except Exception as e:
+                print(f"Error processing Paillier public key: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+
+        print(f"Error: Server did not return a valid Paillier public key. Response: {response}")
         return None
 
     def add_friend(self, friend):
@@ -329,18 +509,44 @@ class Client:
         return self.send_command(f"EFRIEND_RESPONSE:{sender}:{encrypted_response}\n".encode())
 
     def get_friends_list(self):
+        """Get the list of friends with improved debugging"""
+        print("Requesting friends list from server...")
+
         query = "GET_FRIENDS"
 
+        # Encrypt the query
         plaintext_int = crypto_utils.string_to_int(query)
         ciphertext = elgamal.encrypt(self.server_pubkey, plaintext_int)
         encrypted_query = crypto_utils.serialize_ciphertext(ciphertext)
+
+        # Send the encrypted query
+        print("Sending encrypted EGET_FRIENDS request...")
         response = self.send_command(f"EGET_FRIENDS:{encrypted_query}\n".encode())
+        print(f"DEBUG: Raw response from server: {response}")
+
+        # Process the response
         if response.startswith("EGET_FRIENDS_RESP:"):
-            _, encrypted_payload = response.split(":", 1)
-            ciphertext = crypto_utils.deserialize_ciphertext(encrypted_payload)
-            plaintext_int = elgamal.decrypt(self.private_key, ciphertext[0], ciphertext[1])
-            decrypted_response = crypto_utils.int_to_string(plaintext_int)
-            return decrypted_response
+            try:
+                # Extract and decrypt the encrypted payload
+                _, encrypted_payload = response.split(":", 1)
+                print("DEBUG: Encrypted payload received, attempting to decrypt...")
+
+                ciphertext = crypto_utils.deserialize_ciphertext(encrypted_payload)
+                print(f"DEBUG: Deserialized ciphertext: {ciphertext}")
+
+                plaintext_int = elgamal.decrypt(self.private_key, ciphertext[0], ciphertext[1])
+                print(f"DEBUG: Decrypted integer: {plaintext_int}")
+
+                decrypted_response = crypto_utils.int_to_string(plaintext_int)
+                print(f"DEBUG: Decrypted string: {decrypted_response}")
+
+                # Convert to FRIENDS: format for consistency
+                return f"FRIENDS:{decrypted_response}"
+            except Exception as e:
+                print(f"ERROR decrypting friends list: {e}")
+                return f"ERROR:Failed to decrypt friends list: {e}"
+
+        # If we didn't get an encrypted response, return whatever we got
         return response
 
     def encrypt_command(self, command_str, recipient_pubkey):
@@ -399,8 +605,219 @@ class Client:
 
     # Proximity functionality removed
     def initiate_proximity_check(self, friend):
-        print("ERROR: Proximity functionality has been removed")
-        return False
+        """Initiate a proximity check with a friend using your own Paillier public key."""
+        if not self.username:
+            return "ERROR:Not logged in"
+
+        if not self.current_location:
+            return "ERROR:You need to set your location first"
+
+        # Ensure our Paillier keys are available; regenerate if necessary.
+        if not self.paillier_public_key or not self.paillier_private_key:
+            print("ERROR: Your Paillier keys are not available. Trying to regenerate...")
+            try:
+                self.paillier_public_key, self.paillier_private_key = paillier.generate_keys()
+                print("Generated new Paillier keys")
+                self.save_keys()  # Save the newly generated keys
+
+                # Register with server
+                paillier_pubkey_str = f"{self.paillier_public_key[0]},{self.paillier_public_key[1]}"
+                print(f"Registering new Paillier public key with server: {paillier_pubkey_str[:50]}...")
+                self.send_command(f"REGISTER_PAILLIER_PUBKEY:{paillier_pubkey_str}")
+            except Exception as e:
+                return f"ERROR:Failed to generate Paillier keys: {e}"
+
+        # Retrieve friend's Paillier public key for potential other operations (if needed)
+        # (Not used for encrypting our own location)
+        print(f"Retrieving Paillier public key for {friend}...")
+        friend_pubkey = self.get_friend_paillier_pubkey(friend)
+        if not friend_pubkey:
+            print(f"ERROR: Could not retrieve Paillier public key for {friend}")
+            return "ERROR:Could not retrieve friend's Paillier public key"
+
+        print(f"Successfully retrieved Paillier public key for {friend}")
+        print(f"Friend's key: {str(friend_pubkey)[:50]}...")
+
+        try:
+            # Extract current location
+            x, y = self.current_location
+            print(f"Using your location: ({x}, {y})")
+
+            # IMPORTANT: Encrypt your location using YOUR own Paillier public key
+            print("Encrypting your location using your own Paillier public key...")
+            encrypted_loc = paillier.encrypt_location(self.paillier_public_key, x, y)
+
+            # Serialize for transmission
+            encrypted_loc_str = paillier.serialize_encrypted_location(encrypted_loc)
+            print(f"Location encrypted successfully. Length: {len(encrypted_loc_str)}")
+
+            # Include your Paillier public key in the request
+            paillier_pubkey_str = f"{self.paillier_public_key[0]},{self.paillier_public_key[1]}"
+
+            # Construct and send the proximity request command
+            command = f"PROXIMITY_REQUEST:{friend}:{encrypted_loc_str}:{paillier_pubkey_str}"
+            response = self.send_command(command)
+            if response.startswith("SUCCESS"):
+                print(f"Proximity check request sent to {friend}")
+                return "SUCCESS:Proximity check request sent"
+            else:
+                print(f"Server response: {response}")
+                return response
+        except Exception as e:
+            print(f"Error initiating proximity check: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"ERROR:{str(e)}"
+
+    def handle_proximity_request(self, sender, encrypted_loc_str, paillier_pubkey_str):
+        """Handle an incoming proximity check request with enhanced debugging"""
+        try:
+            print("\n===== DEBUG: HANDLING PROXIMITY REQUEST =====")
+            if not self.current_location:
+                print("DEBUG: Cannot perform proximity check: location not set")
+                return
+
+            # Parse friend's Paillier public key
+            try:
+                print(f"DEBUG: Parsing sender's Paillier public key")
+                n, g = map(int, paillier_pubkey_str.split(','))
+                sender_pubkey = (n, g)
+                print(f"DEBUG: Parsed sender public key successfully")
+                # Cache it for future use
+                self.friend_paillier_pubkeys[sender] = sender_pubkey
+            except Exception as e:
+                print(f"DEBUG: Error parsing Paillier public key: {e}")
+                return
+
+            # Deserialize encrypted location
+            try:
+                print(f"DEBUG: Deserializing encrypted location from sender")
+                encrypted_loc = paillier.deserialize_encrypted_location(encrypted_loc_str)
+                print(f"DEBUG: Successfully deserialized encrypted location")
+            except Exception as e:
+                print(f"DEBUG: Error deserializing location: {e}")
+                return
+
+            # Get my location
+            my_x, my_y = self.current_location
+            print(f"DEBUG: My location: ({my_x}, {my_y})")
+
+            # Log the threshold
+            print(f"DEBUG: Using proximity threshold: {PROXIMITY_THRESHOLD}")
+            print(f"DEBUG: This means users are 'nearby' if squared Euclidean distance ≤ {PROXIMITY_THRESHOLD}")
+
+            # Compute proximity result (encrypted)
+            try:
+                print(f"DEBUG: Computing proximity using homomorphic operations")
+                encrypted_result = paillier.compute_proximity(
+                    sender_pubkey,
+                    encrypted_loc,
+                    my_x,
+                    my_y,
+                    PROXIMITY_THRESHOLD
+                )
+                print(f"DEBUG: Successfully computed encrypted proximity result")
+            except Exception as e:
+                print(f"DEBUG: Error in compute_proximity: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+            # Serialize for transmission
+            try:
+                print(f"DEBUG: Serializing result for transmission")
+                encrypted_result_str = paillier.serialize_ciphertext(encrypted_result)
+                print(f"DEBUG: Result serialized. Length: {len(encrypted_result_str)}")
+            except Exception as e:
+                print(f"DEBUG: Error serializing result: {e}")
+                return
+
+            # Send result back
+            try:
+                print(f"DEBUG: Sending result back to {sender}")
+                self.send_command(f"PROXIMITY_RESULT:{sender}:{encrypted_result_str}\n".encode())
+                print(f"DEBUG: Sent proximity check result to {sender}")
+            except Exception as e:
+                print(f"DEBUG: Error sending result: {e}")
+
+            print("===== END DEBUG: HANDLING PROXIMITY REQUEST =====\n")
+
+        except Exception as e:
+            print(f"DEBUG: Unexpected error handling proximity request: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def handle_proximity_result(self, sender, encrypted_result_str):
+        """Handle a proximity check result with improved negative number handling"""
+        try:
+            print("\n===== DEBUG: HANDLING PROXIMITY RESULT =====")
+            print(f"Received encrypted result from {sender}")
+
+            # Deserialize encrypted result
+            try:
+                print(f"DEBUG: Deserializing encrypted result")
+                encrypted_result = paillier.deserialize_ciphertext(encrypted_result_str)
+                print(f"DEBUG: Successfully deserialized result")
+            except Exception as e:
+                print(f"DEBUG: Error deserializing result: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+            # Decrypt the result using my private key
+            try:
+                print(f"DEBUG: Decrypting result with my private key")
+                decrypted_result = paillier.decrypt(
+                    self.paillier_private_key,
+                    self.paillier_public_key,
+                    encrypted_result
+                )
+                print(f"DEBUG: Successfully decrypted result: {decrypted_result}")
+
+                # For Paillier with very large values, we need to interpret correctly
+                n = self.paillier_public_key[0]
+
+                # Print both possible interpretations for debugging
+                print(f"DEBUG: Raw decrypted result: {decrypted_result}")
+                print(f"DEBUG: As negative (if applicable): {decrypted_result - n}")
+                print(f"DEBUG: Modulus n: {n}")
+
+                # In Paillier, a negative number -x is represented as (n - x)
+                # For our proximity test, a negative result means "nearby"
+
+                # If the value is closer to n than to 0, treat it as negative
+                if decrypted_result > n / 2:
+                    adjusted_result = decrypted_result - n
+                    print(f"DEBUG: Interpreting as negative: {adjusted_result}")
+                else:
+                    adjusted_result = decrypted_result
+                    print(f"DEBUG: Interpreting as positive: {adjusted_result}")
+
+                # If adjusted result ≤ 0, users are nearby (distance² ≤ threshold)
+                nearby = adjusted_result <= 0
+                print(f"DEBUG: Final interpretation - Is nearby: {nearby}")
+
+                if nearby:
+                    result_msg = f"{sender} is nearby (within threshold)"
+                else:
+                    result_msg = f"{sender} is not nearby (outside threshold)"
+
+                print(f"DEBUG: Final result message: {result_msg}")
+                self.message_queue.put(f"NOTIFICATION:{result_msg}")
+
+            except Exception as e:
+                print(f"DEBUG: Error decrypting result: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+            print("===== END DEBUG: HANDLING PROXIMITY RESULT =====\n")
+
+        except Exception as e:
+            print(f"DEBUG: Unexpected error processing proximity result: {e}")
+            import traceback
+            traceback.print_exc()
+            self.message_queue.put(f"NOTIFICATION:Error processing proximity result from {sender}")
 
     def print_messages(self):
         while not self.message_queue.empty():
@@ -423,6 +840,51 @@ class Client:
             else:
                 print(msg)
 
+    def display_friends_for_proximity(self):
+        """Display friend list and allow user to select for proximity check"""
+        print("\nRetrieving your friends list...")
+        response = self.get_friends_list()
+
+        # Debug output to see exactly what response we're getting
+        print(f"DEBUG: Response from get_friends_list: {response}")
+
+        if not response.startswith("FRIENDS:"):
+            print(f"Error retrieving friends list: {response}")
+            return None
+
+        # Extract friends list
+        friends_str = response.split(':', 1)[1].strip()
+
+        # Check if friends list is empty
+        if not friends_str:
+            print("You don't have any friends yet. Add friends first to use proximity check.")
+            return None
+
+        # Parse friends list
+        friends = friends_str.split(',')
+
+        print("\nYour Friends:")
+        for i, friend in enumerate(friends, 1):
+            print(f"{i}. {friend}")
+
+        # Get selection from user
+        while True:
+            try:
+                choice = input("\nSelect a friend to check proximity (0 to cancel): ")
+                choice = int(choice.strip())
+
+                if choice == 0:
+                    return None
+
+                if 1 <= choice <= len(friends):
+                    return friends[choice - 1]
+
+                print(f"Invalid selection. Please enter a number between 0 and {len(friends)}.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+            except Exception as e:
+                print(f"Error: {e}")
+                return None
 
 def masked_input():
     password = ""
@@ -468,6 +930,7 @@ def masked_input():
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return password
 
+
 def main():
     client = Client()
     if not client.connect():
@@ -475,14 +938,16 @@ def main():
 
     threading.Thread(target=client.receive_handler, daemon=True).start()
 
-    print("\nHybrid Encryption Location Sharing Client")
-    print("ElGamal for general encryption")
-    print("Proximity functionality removed")
+    print("\nSecure Location Sharing Client")
+    print("ElGamal encryption for authentication and messaging")
+    print("Paillier homomorphic encryption for privacy-preserving proximity checks")
     print("=================================================================")
 
-    while True:
+    logged_in = False
+    while not logged_in:
         print("\n1. Register\n2. Login\n3. Exit")
         choice = input("Choice: ").strip()
+
         if choice == '1':
             username = input("Username: ").strip()
             try:
@@ -490,33 +955,27 @@ def main():
             except Exception:
                 password = masked_input()
             print(client.register(username, password))
+
         elif choice == '2':
             username = input("Username: ").strip()
             try:
                 password = getpass.getpass("Password: ")
             except Exception:
                 password = masked_input()
-            if client.login(username, password):
+
+            print("Attempting to login...")
+            login_success = client.login(username, password)
+
+            if login_success:
                 print("Login successful!")
-                while True:
-                    try:
-                        print("Please enter coordinates (0-99999):")
-                        x = int(input("X: "))
-                        y = int(input("Y: "))
-                        if not (0 <= x <= 99999 and 0 <= y <= 99999):
-                            print("Error: Coordinates must be between 0 and 99999")
-                            continue
-                        result = client.update_location(x, y)
-                        if "SUCCESS" in result:
-                            break
-                        else:
-                            print(result)
-                    except ValueError:
-                        print("Invalid coordinates. Please enter numeric values.")
-                break
+                logged_in = True
+            else:
+                print("Login failed. Please try again.")
+
         elif choice == '3':
             client.running = False
             return
+
         else:
             print("Invalid choice")
 
@@ -588,8 +1047,41 @@ def main():
             except ValueError:
                 print("Invalid coordinates. Please enter numeric values.")
         elif choice == '3':
-            friend_name = input("Enter friend's username for proximity check: ").strip()
-            print(client.initiate_proximity_check(friend_name))
+            print("\nPrivacy-Preserving Proximity Check")
+            print("This will check if your friend is within √2500 ≈ 50 units of your location")
+            print("Your exact coordinates will remain private\n")
+
+            # Check if location is set before allowing proximity check
+            if not client.current_location:
+                print("Error: You need to update your location before you can check proximity.")
+                print("Please use option 2 (Update Location) first.")
+                continue
+
+            try:
+                print("Displaying friends list for proximity check...")
+                # Display friend selection menu
+                selected_friend = client.display_friends_for_proximity()
+
+                if selected_friend:
+                    print(f"Initiating proximity check with {selected_friend}...")
+                    try:
+                        response = client.initiate_proximity_check(selected_friend)
+                        if response.startswith("ERROR"):
+                            print(f"Error during proximity check: {response}")
+                        else:
+                            print("Proximity check request sent. You'll be notified of the result.")
+                    except Exception as e:
+                        print(f"Exception during proximity check: {e}")
+                else:
+                    print("Proximity check cancelled or no friend was selected.")
+            except Exception as e:
+                print(f"Error in proximity check menu: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # Wait for user to acknowledge before returning to main menu
+            input("\nPress Enter to return to main menu...")
+
         elif choice == '4':
             print("Checking your location status...")
             client.get_current_location()

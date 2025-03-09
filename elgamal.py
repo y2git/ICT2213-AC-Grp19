@@ -1,10 +1,14 @@
 import random
 from sympy import nextprime
 
-def generate_keys(key_bits=128):
-    p = nextprime(2**key_bits)
-    g = random.randint(2, p-2)
-    x = random.randint(1, p-2)
+def generate_keys(key_bits=1024):
+    # Use a fixed prime and generator for all clients
+    # This makes the system parameters (p,g) globally consistent
+    p = nextprime(2 ** key_bits)  # Keep the prime generation as is
+    g = 2  # Simple, fixed generator
+
+    # The private/public parts remain unique per user
+    x = random.randint(1, p - 2)
     h = pow(g, x, p)
     return (p, g, h), (p, x)
 

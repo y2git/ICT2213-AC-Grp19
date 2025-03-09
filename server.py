@@ -2,13 +2,14 @@ from datetime import datetime
 import socket
 import threading
 import sqlite3
+import crypto_utils
 import elgamal
 import hashlib
 import os
 import base64
 import json
 import queue
-from hmac_utils import compute_hmac, verify_hmac
+from crypto_utils import deserialize_ciphertext, int_to_string, string_to_int, serialize_ciphertext
 
 server_PORT = 60
 server_IP = '127.0.0.1'
@@ -66,7 +67,13 @@ def init_db():
                           g TEXT,
                           h TEXT,
                           FOREIGN KEY(username) REFERENCES user(username))''')
-        # Remove bgn_public_keys table as proximity code is removed
+        cursor.execute('''CREATE TABLE IF NOT EXISTS offline_friend_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT,
+            receiver TEXT,
+            encrypted_payload TEXT,
+            timestamp TEXT
+        )''')
         conn.commit()
     finally:
         conn.close()
@@ -149,6 +156,20 @@ def update_location(username, location_data):
         print(f"Error updating location for {username}: {e}")
         return False
 
+def store_offline_friend_response(sender, receiver, encrypted_payload):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute('INSERT INTO offline_friend_responses (sender, receiver, encrypted_payload, timestamp) VALUES (?, ?, ?, ?)',
+                       (sender, receiver, encrypted_payload, timestamp))
+        conn.commit()
+    except Exception as e:
+        print("Error storing offline friend response:", e)
+    finally:
+        conn.close()
+
+
 def handle_get_friend_location(username, friend, con):
     try:
         conn = get_db_connection()
@@ -180,6 +201,7 @@ def handle_friend_request(sender, target, con):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        print(f"DEBUG: Processing friend request from {sender} to {target}")
         if sender == target:
             con.send("ERROR:Cannot add yourself as a friend\n".encode())
             return
@@ -212,8 +234,6 @@ def handle_friend_request(sender, target, con):
         cursor.execute('INSERT INTO friend_requests VALUES (?, ?, ?, ?)', (sender, target, 'pending', timestamp))
         conn.commit()
         con.send("SUCCESS:Friend request sent\n".encode())
-        if target in connected_clients:
-            connected_clients[target][0].send(f"NOTIFICATION:New friend request from {sender}\n".encode())
     except Exception as e:
         con.send(f"ERROR:{str(e)}\n".encode())
     finally:
@@ -234,7 +254,15 @@ def handle_friend_response(username, sender, response, con):
             conn.commit()
             con.send("SUCCESS:Friend request accepted\n".encode())
             if sender in connected_clients:
-                connected_clients[sender][0].send(f"NOTIFICATION:{username} accepted your friend request\n".encode())
+                sender_pubkey = client_public_keys.get(sender)
+                if sender_pubkey:
+                    plaintext_notification = f"{username} accepted your friend request"
+                    plaintext_int = crypto_utils.string_to_int(plaintext_notification)
+                    ciphertext = elgamal.encrypt(sender_pubkey, plaintext_int)
+                    encrypted_notification = crypto_utils.serialize_ciphertext(ciphertext)
+                    connected_clients[sender][0].send(f"NOTIFICATION:{encrypted_notification}\n".encode())
+                else:
+                    connected_clients[sender][0].send(f"NOTIFICATION:{username} accepted your friend request\n".encode())
         else:
             cursor.execute('DELETE FROM friend_requests WHERE sender = ? AND receiver = ?', (sender, username))
             conn.commit()
@@ -244,12 +272,16 @@ def handle_friend_response(username, sender, response, con):
     finally:
         conn.close()
 
+
 def get_pending_requests(username, con):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT sender FROM friend_requests WHERE receiver = ? AND status = "pending"', (username,))
+        query = 'SELECT sender FROM friend_requests WHERE receiver = ? AND status = "pending"'
+        print(f"DEBUG: Executing query: {query} with username: {username}")
+        cursor.execute(query, (username,))
         requests = [row['sender'] for row in cursor.fetchall()]
+        print(f"DEBUG: Found friend requests: {requests}")
         con.send(f"REQUESTS:{','.join(requests)}\n".encode())
     except Exception as e:
         con.send(f"ERROR:{str(e)}\n".encode())
@@ -306,6 +338,7 @@ def client_handler(con, addr):
     username = None
     buffer = ""
     try:
+        # Send server's ElGamal public key for key exchange
         con.send(f"HELLO:{server_public_key[0]},{server_public_key[1]},{server_public_key[2]}\n".encode())
         while True:
             data = con.recv(BUF_SIZE).decode()
@@ -320,12 +353,63 @@ def client_handler(con, addr):
                     command = "UPDATE_LOCATION"
                     location_data = msg[len("UPDATE_LOCATION:"):]
                     parts = [command, location_data]
-                # Proximity-related commands now return an error immediately.
-                elif msg.startswith(("PROXIMITY_REQUEST:", "PROXIMITY_RESPONSE:", "YAO_CIRCUIT:",
-                                      "YAO_OT_INIT:", "YAO_OT_COMPLETE:", "YAO_INPUTS:", "YAO_RESULT:")):
-                    parts = msg.split(':', 3)
-                    con.send("ERROR:Proximity functionality removed\n".encode())
+                # Handle encrypted login commands
+                elif msg.startswith("ELOGIN:"):
+                    # Extract the encrypted payload
+                    _, encrypted_payload = msg.split(":", 1)
+                    # Deserialize ciphertext and decrypt credentials
+                    from crypto_utils import deserialize_ciphertext, int_to_string
+                    ciphertext = deserialize_ciphertext(encrypted_payload)
+                    # Decrypt using the server's private key
+                    plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                    credentials = int_to_string(plaintext_int)  # Expected format: "username:password"
+                    try:
+                        username_attempt, password = credentials.split(":", 1)
+                    except Exception as e:
+                        con.send("ERROR:Invalid credentials format\n".encode())
+                        continue
+                    # Process login using the plain credentials
+                    if username_attempt in connected_clients:
+                        con.send("ERROR:User already logged in\n".encode())
+                        continue
+                    if login_user(username_attempt, password):
+                        username = username_attempt
+                        connected_clients[username] = (con, addr)
+                        con.send("SUCCESS:Logged in\n".encode())
+                        print(f"User {username} logged in from {addr}")
+                    else:
+                        con.send("ERROR:Invalid credentials\n".encode())
                     continue
+
+                elif msg.startswith("EREGISTER:"):
+                    # Extract the encrypted payload
+                    _, encrypted_payload = msg.split(":", 1)
+                    # Deserialize ciphertext and decrypt credentials
+                    from crypto_utils import deserialize_ciphertext, int_to_string
+                    ciphertext = deserialize_ciphertext(encrypted_payload)
+                    plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                    credentials = int_to_string(plaintext_int)  # Expected format: "username:password"
+
+                    try:
+                        username_attempt, password = credentials.split(":", 1)
+                    except Exception:
+                        con.send("ERROR:Invalid credentials format\n".encode())
+                        continue
+
+                    # Attempt to register the user
+                    if create_user(username_attempt, password):
+                        con.send("SUCCESS:Registered\n".encode())
+                    else:
+                        con.send("ERROR:Username exists\n".encode())
+                    continue
+
+                # # For any friend management or proximity commands, return an error since they have been removed.
+                # elif msg.startswith(("PROXIMITY_REQUEST:", "PROXIMITY_RESPONSE:",
+                #                      "YAO_CIRCUIT:", "YAO_OT_INIT:",
+                #                      "YAO_OT_COMPLETE:", "YAO_INPUTS:", "YAO_RESULT:")):
+                #     parts = msg.split(':', 3)
+                #     con.send("ERROR:Proximity functionality removed\n".encode())
+                #     continue
                 else:
                     parts = msg.strip().split(':', 2)
                 if not parts:
@@ -342,6 +426,7 @@ def client_handler(con, addr):
                         else:
                             con.send("ERROR:Username exists\n".encode())
                     elif command == 'LOGIN':
+                        # Plain LOGIN command can still be supported if needed.
                         if len(parts) < 3:
                             con.send("ERROR:Missing fields\n".encode())
                             continue
@@ -364,20 +449,31 @@ def client_handler(con, addr):
                             username = None
                         else:
                             con.send("ERROR:Not logged in\n".encode())
+
                     elif command == 'REGISTER_PUBKEY':
+                        print(f"REGISTER_PUBKEY branch reached. Current username: {username}")
                         if not username or len(parts) < 2:
                             con.send("ERROR:Login required\n".encode())
                             continue
-                        pubkey_parts = parts[1].split(',')
-                        if len(pubkey_parts) != 3:
-                            con.send("ERROR:Invalid public key format\n".encode())
+                        # Assume the client sends its public key as a comma-separated string: "p,g,h"
+                        client_pubkey_str = parts[1]
+                        try:
+                            pubkey_parts = client_pubkey_str.split(',')
+                            if len(pubkey_parts) != 3:
+                                con.send("ERROR:Invalid public key format\n".encode())
+                                continue
+                            client_pubkey = tuple(map(int, pubkey_parts))
+                        except Exception as e:
+                            con.send("ERROR:Invalid public key values\n".encode())
                             continue
-                        pubkey = tuple(map(int, pubkey_parts))
-                        client_public_keys[username] = pubkey
-                        if save_public_key(username, pubkey):
-                            con.send("SUCCESS:Public key registered\n".encode())
+
+                        client_public_keys[username] = client_pubkey
+                        if save_public_key(username, client_pubkey):
+                            con.send(f"SUCCESS:Public key registered:{client_pubkey_str}\n".encode())
                         else:
                             con.send("ERROR:Failed to save public key\n".encode())
+
+
                     elif command == 'GET_PUBKEY':
                         if not username or len(parts) < 2:
                             con.send("ERROR:Login required\n".encode())
@@ -385,29 +481,202 @@ def client_handler(con, addr):
                         target = parts[1]
                         pubkey = get_public_key(target)
                         if pubkey:
-                            con.send(f"PUBKEY:{target}:{pubkey[0]},{pubkey[1]},{pubkey[2]}\n".encode())
+                            client_pubkey_str = f"{pubkey[0]},{pubkey[1]},{pubkey[2]}"
+                            con.send(f"PUBKEY:{target}:{client_pubkey_str}\n".encode())
                         else:
                             con.send(f"ERROR:No public key for {target}\n".encode())
-                    elif command == 'ADD_FRIEND':
-                        if not username or len(parts) < 2:
-                            con.send("ERROR:Invalid request\n".encode())
+
+                    elif command == "EFRIEND_RESPONSE":
+                        print("DEBUG: Raw friend management message:", msg)
+                        parts = msg.split(":", 2)
+                        print("DEBUG: Split parts:", parts, "Length:", len(parts))
+                        if len(parts) < 3:
+                            con.send("ERROR:Invalid request format\n".encode())
                             continue
-                        handle_friend_request(username, parts[1], con)
-                    elif command == 'FRIEND_RESPONSE':
-                        if not username or len(parts) < 3:
-                            con.send("ERROR:Invalid request\n".encode())
+                        friend_request_sender = parts[1].strip()  # The user who originally sent the friend request.
+                        encrypted_payload = parts[2].strip()  # The encrypted friend response.
+
+                        try:
+                            # Decrypt the payload using the server's private key.
+                            from crypto_utils import deserialize_ciphertext, int_to_string
+                            ciphertext = deserialize_ciphertext(encrypted_payload)
+                            decrypted_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                            friend_response = int_to_string(decrypted_int).strip()  # Should be "ACCEPT" or "DECLINE"
+                            print(f"DEBUG: Decrypted friend response: {friend_response}")
+                        except Exception as e:
+                            con.send(f"ERROR:Failed to decrypt friend response: {str(e)}\n".encode())
                             continue
-                        handle_friend_response(username, parts[1], parts[2], con)
-                    elif command == 'GET_REQUESTS':
+
+                            # Process the friend response by updating the friendships table.
+                            # Here, 'username' is the user (e.g. aaa) responding to a friend request from friend_request_sender (e.g. bbb).
+                        handle_friend_response(username, friend_request_sender, friend_response, con)
+                        con.send("SUCCESS:Friend response processed\n".encode())
+                        continue
+
+                    elif command == "EADD_FRIEND":
+                        if len(parts) < 3:
+                            con.send("ERROR:Invalid request format\n".encode())
+                            continue
+                        target = parts[1]
+                        encrypted_payload = parts[2]
+                        print(f"DEBUG: EADD_FRIEND request from {username} to {target}")
+                        # Always handle the friend request to add it to the database
+                        handle_friend_request(username, target, con)
+                        # Additionally forward the encrypted message if the target is online
+                        if target in connected_clients:
+                            to_con = connected_clients[target][0]
+                            message_to_forward = f"EADD_FRIEND:{username}:{encrypted_payload}\n"
+                            print(f"DEBUG: Forwarding to {target}: {message_to_forward}")
+                            to_con.send(message_to_forward.encode())
+
+                    elif command == "EGET_FRIEND_RESPONSES":
                         if not username:
                             con.send("ERROR:Login required\n".encode())
                             continue
-                        get_pending_requests(username, con)
-                    elif command == 'GET_FRIENDS':
+                        try:
+                            # Expect an encrypted query in the format: EGET_FRIEND_RESPONSES:<encrypted_payload>
+                            _, encrypted_payload = msg.split(":", 1)
+                        except Exception as e:
+                            con.send("ERROR:Invalid request format\n".encode())
+                            continue
+                        try:
+                            # Decrypt the encrypted query using the server's private key.
+                            ciphertext = deserialize_ciphertext(encrypted_payload)
+                            plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                            query = int_to_string(plaintext_int)
+
+                            # Optionally, verify that the query is exactly what you expect.
+                            if query != "GET_FRIEND_RESPONSES":
+                                con.send("ERROR:Invalid query\n".encode())
+
+                                continue
+
+                        except Exception as e:
+                            con.send("ERROR:Decryption failed\n".encode())
+                            continue
+
+                        # Retrieve offline friend responses for the logged-in user.
+                        conn = get_db_connection()
+                        try:
+                            cursor = conn.cursor()
+
+                            # offline_friend_responses table should store sender, receiver, encrypted_payload, timestamp
+                            cursor.execute(
+                                'SELECT sender, encrypted_payload FROM offline_friend_responses WHERE receiver = ?',
+                                (username,))
+
+                            responses = cursor.fetchall()
+
+                            # Combine responses into a single string with a delimiter; e.g. "sender1:payload1;sender2:payload2"
+                            response_list = []
+
+                            for row in responses:
+                                sender = row['sender']
+                                payload = row['encrypted_payload']
+                                response_list.append(f"{sender}:{payload}")
+                            responses_str = ";".join(response_list)
+
+                        finally:
+                            conn.close()
+
+                        # Encrypt the responses string using the client's public key.
+
+                        if username in client_public_keys:
+                            client_pubkey = client_public_keys[username]
+                            ciphertext_resp = elgamal.encrypt(client_pubkey, string_to_int(responses_str))
+                            encrypted_response = serialize_ciphertext(ciphertext_resp)
+                            con.send(f"EGET_FRIEND_RESPONSES_RESP:{encrypted_response}\n".encode())
+
+                        else:
+                            con.send("ERROR:No public key registered\n".encode())
+
+                        continue
+
+                    elif command == "EGET_REQUESTS":
                         if not username:
                             con.send("ERROR:Login required\n".encode())
                             continue
-                        get_friends_list(username, con)
+                        try:
+                            # The encrypted request is expected to be in the format:
+                            # EGET_REQUESTS:<encrypted_payload>
+                            _, encrypted_payload = msg.split(":", 1)
+                        except Exception as e:
+                            con.send("ERROR:Invalid request format\n".encode())
+                            continue
+                        try:
+                            # Decrypt the encrypted payload using the server's private key.
+                            ciphertext = deserialize_ciphertext(encrypted_payload)
+                            plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                            query = int_to_string(plaintext_int)  # Expected to be "GET_REQUESTS"
+                        except Exception as e:
+                            con.send("ERROR:Decryption failed\n".encode())
+                            continue
+                        # Retrieve pending friend requests for the authenticated user.
+                        conn = get_db_connection()
+                        try:
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                'SELECT sender FROM friend_requests WHERE receiver = ? AND status = "pending"',
+                                (username,))
+                            requests = [row['sender'] for row in cursor.fetchall()]
+                            requests_str = ",".join(requests)
+                        finally:
+                            conn.close()
+
+                        # Encrypt the response using the client's public key.
+                        if username in client_public_keys:
+                            client_pubkey = client_public_keys[username]
+                            ciphertext_resp = elgamal.encrypt(client_pubkey, string_to_int(requests_str))
+                            encrypted_response = serialize_ciphertext(ciphertext_resp)
+                            con.send(f"EGET_REQUESTS_RESP:{encrypted_response}\n".encode())
+                        else:
+                            con.send("ERROR:No public key registered\n".encode())
+                        continue
+
+                    elif command == "EGET_FRIENDS":
+                        if not username:
+                            con.send("ERROR:Login required\n".encode())
+                            continue
+                        try:
+                            # Expect the encrypted query in the format: EGET_FRIENDS:<encrypted_payload>
+                            _, encrypted_payload = msg.split(":", 1)
+                        except Exception as e:
+                            con.send("ERROR:Invalid request format\n".encode())
+                            continue
+                        try:
+                            # Decrypt the payload using the server's private key.
+                            ciphertext = deserialize_ciphertext(encrypted_payload)
+                            plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                            query = int_to_string(plaintext_int)  # Should be "GET_FRIENDS"
+                            if query != "GET_FRIENDS":
+                                con.send("ERROR:Invalid query\n".encode())
+                                continue
+                        except Exception as e:
+                            con.send("ERROR:Decryption failed\n".encode())
+                            continue
+                        # Retrieve the friends list for the authenticated user.
+                        conn = get_db_connection()
+                        try:
+                            cursor = conn.cursor()
+                            cursor.execute('''SELECT user2 as friend FROM friendships WHERE user1 = ?
+                                              UNION
+                                              SELECT user1 as friend FROM friendships WHERE user2 = ?''',
+                                           (username, username))
+                            friends = [row['friend'] for row in cursor.fetchall()]
+                            friends_str = ",".join(friends)
+                        finally:
+                            conn.close()
+
+                        # Encrypt the response using the client's public key.
+                        if username in client_public_keys:
+                            client_pubkey = client_public_keys[username]
+                            ciphertext_resp = elgamal.encrypt(client_pubkey, string_to_int(friends_str))
+                            encrypted_response = serialize_ciphertext(ciphertext_resp)
+                            con.send(f"EGET_FRIENDS_RESP:{encrypted_response}\n".encode())
+                        else:
+                            con.send("ERROR:No public key registered\n".encode())
+                        continue
+
                     elif command == 'UPDATE_LOCATION':
                         if not username:
                             con.send("ERROR:Login required\n".encode())
@@ -447,6 +716,8 @@ def client_handler(con, addr):
             del connected_clients[username]
         con.close()
         print(f"{addr} disconnected")
+
+
 
 if __name__ == "__main__":
     init_db()

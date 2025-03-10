@@ -1,7 +1,17 @@
 import random
 import math
 from sympy import isprime, nextprime
+import time
 
+
+def timing_decorator(func):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()  # High resolution timer
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        print(f"{func.__name__} executed in {end - start:.6f} seconds")
+        return result
+    return wrapper
 
 def generate_keys(key_size=1024):
     """
@@ -193,7 +203,7 @@ def deserialize_encrypted_location(encrypted_loc_str):
         raise ValueError("Invalid encrypted location format")
     return tuple(int(part) for part in parts)
 
-
+@timing_decorator
 def compute_proximity(public_key, encrypted_loc, my_x, my_y, threshold=2500):
     """
     Compute encrypted proximity result using homomorphic properties

@@ -507,6 +507,22 @@ def client_handler(con, addr):
                         con.send("ERROR:Username exists\n".encode())
                     continue
 
+                elif msg.startswith("EUPDATE_LOCATION:"):
+                    try:
+                        # Extract the encrypted payload (the part after the command prefix)
+                        _, encrypted_payload = msg.split(":", 1)
+                        # Deserialize and decrypt the ciphertext
+                        ciphertext = crypto_utils.deserialize_ciphertext(encrypted_payload)
+                        plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
+                        location_str = crypto_utils.int_to_string(plaintext_int)
+                        # Update the location using the decrypted coordinates
+                        if update_location(username, location_str):
+                            con.send("SUCCESS:Location updated\n".encode())
+                        else:
+                            con.send("ERROR:Failed to update location\n".encode())
+                    except Exception as e:
+                        con.send(f"ERROR:Failed to process encrypted location update: {str(e)}\n".encode())
+
                 else:
                     parts = msg.strip().split(':', 2)
                 if not parts:

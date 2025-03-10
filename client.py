@@ -582,7 +582,14 @@ class Client:
                 return "ERROR:Coordinates must be between 0 and 99999"
             self.current_location = (x, y)
             self.current_grid_cell = (x // 1000, y // 1000)
-            response = self.send_command(f"UPDATE_LOCATION:{x},{y}\n".encode())
+            # Create a string representation of the location
+            location_str = f"{x},{y}"
+            # Encrypt the location using the server's public key
+            plaintext_int = crypto_utils.string_to_int(location_str)
+            ciphertext = elgamal.encrypt(self.server_pubkey, plaintext_int)
+            encrypted_location = crypto_utils.serialize_ciphertext(ciphertext)
+            # Send the encrypted location update with a new command prefix
+            response = self.send_command(f"EUPDATE_LOCATION:{encrypted_location}\n".encode())
             print(response)
             return response
         except ValueError:
@@ -611,6 +618,8 @@ class Client:
 
         if not self.current_location:
             return "ERROR:You need to set your location first"
+
+        self.proximity_start_time = time.perf_counter()
 
         # Ensure our Paillier keys are available; regenerate if necessary.
         if not self.paillier_public_key or not self.paillier_private_key:
@@ -810,6 +819,13 @@ class Client:
                 import traceback
                 traceback.print_exc()
                 return
+
+            # Compute and display the round-trip CPU overhead
+            if hasattr(self, 'proximity_start_time'):
+                elapsed = time.perf_counter() - self.proximity_start_time
+                print(f"Proximity check round-trip CPU time: {elapsed:.6f} seconds")
+                # Optionally, remove the attribute after using it
+                del self.proximity_start_time
 
             print("===== END DEBUG: HANDLING PROXIMITY RESULT =====\n")
 

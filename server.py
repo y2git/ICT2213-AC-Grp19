@@ -7,7 +7,7 @@ import elgamal
 import hashlib
 import os
 import base64
-from crypto_utils import deserialize_ciphertext, int_to_string, string_to_int, serialize_ciphertext
+from crypto_utils import string_to_int, serialize_ciphertext
 
 
 server_PORT = 60
@@ -145,26 +145,6 @@ def create_user(username, password):
         return False
     finally:
         conn.close()
-
-def update_location(username, location_data):
-    try:
-        # Assume simple "x,y" coordinates format
-        coordinates = location_data.split(',')
-        if len(coordinates) != 2:
-            raise ValueError("Coordinates must be in format: x,y")
-        x, y = map(int, coordinates)
-        if not (0 <= x <= 99999 and 0 <= y <= 99999):
-            raise ValueError("Coordinates must be between 0 and 99999")
-        location_data = f"{x},{y}"
-        encrypted_locations[username] = {
-            "data": location_data,
-            "encrypted": False,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        return True
-    except Exception as e:
-        print(f"Error updating location for {username}: {e}")
-        return False
 
 def store_offline_friend_response(sender, receiver, encrypted_payload):
     conn = get_db_connection()
@@ -507,22 +487,6 @@ def client_handler(con, addr):
                         con.send("ERROR:Username exists\n".encode())
                     continue
 
-                elif msg.startswith("EUPDATE_LOCATION:"):
-                    try:
-                        # Extract the encrypted payload (the part after the command prefix)
-                        _, encrypted_payload = msg.split(":", 1)
-                        # Deserialize and decrypt the ciphertext
-                        ciphertext = crypto_utils.deserialize_ciphertext(encrypted_payload)
-                        plaintext_int = elgamal.decrypt(server_private_key, ciphertext[0], ciphertext[1])
-                        location_str = crypto_utils.int_to_string(plaintext_int)
-                        # Update the location using the decrypted coordinates
-                        if update_location(username, location_str):
-                            con.send("SUCCESS:Location updated\n".encode())
-                        else:
-                            con.send("ERROR:Failed to update location\n".encode())
-                    except Exception as e:
-                        con.send(f"ERROR:Failed to process encrypted location update: {str(e)}\n".encode())
-
                 else:
                     parts = msg.strip().split(':', 2)
                 if not parts:
@@ -616,7 +580,7 @@ def client_handler(con, addr):
                             client_pubkey_str = f"{pubkey[0]},{pubkey[1]},{pubkey[2]}"
                             con.send(f"PUBKEY:{target}:{client_pubkey_str}\n".encode())
                         else:
-                            con.send(f"ERROR:No public key for {target}\n".encode())
+                            con.send("ERROR:User Not Found\n".encode())
 
                     elif command == 'GET_PAILLIER_PUBKEY':
                         if not username:
@@ -875,29 +839,6 @@ def client_handler(con, addr):
 
                         handle_proximity_result(username, target, encrypted_result_str, con)
 
-                    elif command == 'UPDATE_LOCATION':
-                        if not username:
-                            con.send("ERROR:Login required\n".encode())
-                            continue
-                        if len(parts) < 2:
-                            con.send("ERROR:Missing location data\n".encode())
-                            continue
-                        location_data = parts[1]
-                        try:
-                            if update_location(username, location_data):
-                                con.send("SUCCESS:Location updated\n".encode())
-                            else:
-                                con.send("ERROR:Failed to update location\n".encode())
-                        except Exception as e:
-                            con.send(f"ERROR:Processing error: {str(e)}\n".encode())
-                    elif command == 'GET_LOCATION':
-                        if not username:
-                            con.send("ERROR:Login required\n".encode())
-                            continue
-                        if username in encrypted_locations:
-                            con.send("SUCCESS:Location available\n".encode())
-                        else:
-                            con.send("ERROR:No location set\n".encode())
                     elif command == 'GET_FRIEND_LOCATION':
                         if not username or len(parts) < 2:
                             con.send("ERROR:Invalid request\n".encode())
@@ -922,11 +863,6 @@ if __name__ == "__main__":
     s.bind((server_IP, server_PORT))
     s.listen(5)
     generate_global_keys()
-    print("\nSecure Location Sharing Server")
-    print("=========================================")
-    print("ElGamal: Used for general encryption (login, friend requests)")
-    print("Paillier: Used for privacy-preserving proximity checks")
-    print("Server acts as a relay for encrypted messages")
     print("Server Online - Waiting for connections...")
 
     try:

@@ -1,17 +1,6 @@
 import random
 import math
 from sympy import isprime, nextprime
-import time
-
-
-def timing_decorator(func):
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()  # High resolution timer
-        result = func(*args, **kwargs)
-        end = time.perf_counter()
-        print(f"{func.__name__} executed in {end - start:.6f} seconds")
-        return result
-    return wrapper
 
 def generate_keys(key_size=1024):
     """
@@ -169,10 +158,6 @@ def extended_gcd(a, b):
 
 # Helper functions for proximity check
 def encrypt_location(public_key, x, y):
-    """
-    Encrypt location coordinates for proximity check
-    Returns: (E(x), E(y), E(x^2), E(y^2))
-    """
     E_x = encrypt(public_key, x)
     E_y = encrypt(public_key, y)
     E_x_squared = encrypt(public_key, x * x)
@@ -203,76 +188,35 @@ def deserialize_encrypted_location(encrypted_loc_str):
         raise ValueError("Invalid encrypted location format")
     return tuple(int(part) for part in parts)
 
-@timing_decorator
 def compute_proximity(public_key, encrypted_loc, my_x, my_y, threshold=2500):
-    """
-    Compute encrypted proximity result using homomorphic properties
-
-    We need to calculate: E((my_x - x)^2 + (my_y - y)^2 - threshold)
-
-    This should be negative if the squared distance is less than threshold
-    """
-    print(f"\n==== DEBUG: COMPUTE_PROXIMITY ====")
-    print(f"My coordinates: ({my_x}, {my_y})")
-    print(f"Threshold: {threshold}")
-    print(f"Public key: {str(public_key)[:50]}...")
 
     E_x, E_y, E_x_squared, E_y_squared = encrypted_loc
     n, g = public_key
-
-    print(f"Extracted encrypted location components")
-
-    # We'll use a more direct approach to calculate the distance
     try:
-        # We want to compute: (my_x - x)^2 + (my_y - y)^2
-        # This expands to: my_x^2 - 2*my_x*x + x^2 + my_y^2 - 2*my_y*y + y^2
 
         # 1. Calculate my_x^2 and my_y^2
         my_x_squared = (my_x * my_x)
         my_y_squared = (my_y * my_y)
-        print(f"My coordinates squared: ({my_x_squared}, {my_y_squared})")
 
         # We want to compute E(my_x^2 + my_y^2)
         plaintext_sum = my_x_squared + my_y_squared
-        print(f"Sum of my squared coordinates: {plaintext_sum}")
         E_my_squared_sum = encrypt(public_key, plaintext_sum)
 
-        # 2. Calculate E(-2*my_x*x) and E(-2*my_y*y)
-        # For multiplying by negative numbers, we need special handling
         mult_x = -2 * my_x
         mult_y = -2 * my_y
-        print(f"Multipliers (modulo n): x={mult_x}, y={mult_y}")
 
         # 3. Apply the multipliers to the encrypted x and y
         E_term_x = multiply_constant(public_key, E_x, mult_x)
         E_term_y = multiply_constant(public_key, E_y, mult_y)
 
         # 4. Combine all terms: E(my_x^2 + my_y^2) + E(-2*my_x*x) + E(-2*my_y*y) + E(x^2) + E(y^2)
-        print(f"Building distance calculation...")
-
-        # Start with E(my_x^2 + my_y^2)
         E_dist_squared = E_my_squared_sum
-        print(f"  + E(my_x^2 + my_y^2)")
-
-        # Add E(-2*my_x*x)
         E_dist_squared = add_encrypted(public_key, E_dist_squared, E_term_x)
-        print(f"  + E(-2*my_x*x)")
-
-        # Add E(-2*my_y*y)
         E_dist_squared = add_encrypted(public_key, E_dist_squared, E_term_y)
-        print(f"  + E(-2*my_y*y)")
-
-        # Add E(x^2)
         E_dist_squared = add_encrypted(public_key, E_dist_squared, E_x_squared)
-        print(f"  + E(x^2)")
-
-        # Add E(y^2)
         E_dist_squared = add_encrypted(public_key, E_dist_squared, E_y_squared)
-        print(f"  + E(y^2)")
 
-        print(f"Completed calculation of E(distance^2)")
-
-        # IMPORTANT: Encrypt the threshold with the same public key
+        # Encrypt the threshold with the same public key
         E_threshold = encrypt(public_key, threshold)
 
         # Subtract threshold from the squared distance
@@ -282,13 +226,9 @@ def compute_proximity(public_key, encrypted_loc, my_x, my_y, threshold=2500):
             E_threshold
         )
 
-        print(f"Successfully computed E(distance^2 - threshold)")
-        print(f"==== END DEBUG: COMPUTE_PROXIMITY ====\n")
-
         return E_dist_squared_minus_threshold
 
     except Exception as e:
-        print(f"ERROR in compute_proximity: {e}")
         import traceback
         traceback.print_exc()
         raise
